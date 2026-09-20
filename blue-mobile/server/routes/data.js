@@ -15,7 +15,7 @@ const router = express.Router();
 
 /* ───────────── الإعدادات (تتبع الحساب بين الأجهزة) ───────────── */
 const SETTINGS_COLS = `lang, theme, shop_name, shop_logo, shop_phone, shop_address,
-                       invoice_footer, currency, default_min_stock`;
+                       invoice_footer, currency, default_min_stock, barcode_quick_sale`;
 async function readSettings(userId) {
   const { rows } = await db.query(`SELECT ${SETTINGS_COLS} FROM settings WHERE user_id = $1`, [userId]);
   if (rows.length) return rows[0];
@@ -41,13 +41,15 @@ router.put("/settings", wrap(async (req, res) => {
   const invoiceFooter = b.invoiceFooter !== undefined ? (b.invoiceFooter ? cleanText(b.invoiceFooter, { field: "invoiceFooter", max: 200, required: false }) : null) : cur.invoice_footer;
   const currency = b.currency !== undefined ? (b.currency ? cleanText(b.currency, { field: "currency", max: 8, required: false }) : "د.ل") : cur.currency;
   const defaultMinStock = b.defaultMinStock !== undefined ? toInt(b.defaultMinStock, { field: "defaultMinStock", min: 0, max: 1000 }) : cur.default_min_stock;
+  const barcodeQuickSale = b.barcodeQuickSale !== undefined ? !!b.barcodeQuickSale : cur.barcode_quick_sale;
 
   const { rows } = await db.query(
-    `INSERT INTO settings (user_id, ${SETTINGS_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    `INSERT INTO settings (user_id, ${SETTINGS_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      ON CONFLICT (user_id) DO UPDATE SET lang=$2, theme=$3, shop_name=$4, shop_logo=$5,
-       shop_phone=$6, shop_address=$7, invoice_footer=$8, currency=$9, default_min_stock=$10, updated_at=now()
+       shop_phone=$6, shop_address=$7, invoice_footer=$8, currency=$9, default_min_stock=$10,
+       barcode_quick_sale=$11, updated_at=now()
      RETURNING ${SETTINGS_COLS}`,
-    [req.user.id, lang, theme, shopName, shopLogo, shopPhone, shopAddress, invoiceFooter, currency, defaultMinStock]);
+    [req.user.id, lang, theme, shopName, shopLogo, shopPhone, shopAddress, invoiceFooter, currency, defaultMinStock, barcodeQuickSale]);
   res.json({ settings: rows[0] });
 }));
 
