@@ -1690,6 +1690,7 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
   <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
   <symbol id="i-printer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></symbol>
   <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+  <symbol id="i-barcode" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5v14M7 5v14M11 5v14M13 5v14M17 5v14M21 5v14" stroke-width="2"/></symbol>
 </svg>
 
 <!-- ═════════ Ambient ═════════ -->
@@ -3346,6 +3347,27 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
       </div>
     </section>
 
+    <section class="card reveal d3" aria-labelledby="t-bcqs">
+      <div class="card-head">
+        <div class="chip"><svg><use href="#i-barcode"/></svg></div>
+        <div>
+          <h2 class="card-title" id="t-bcqs">وضع البيع السريع بالباركود</h2>
+          <p class="card-sub">مسح أي باركود من أي صفحة يفتح فاتورة بيع تلقائيًا ويضيف المنتج إليها</p>
+        </div>
+      </div>
+      <div class="inner">
+        <label class="switch">
+          <input type="checkbox" id="bcQuickSaleToggle" checked>
+          <span class="sw-track"></span>
+          <span class="sw-lbl" id="bcQuickSaleLbl">🟢 مفعل</span>
+        </label>
+        <p class="f-hint" style="margin-top:10px">
+          عند التفعيل: أي مسح بقارئ باركود USB أو Bluetooth أثناء استخدام المنظومة (وأنت غير متمركز داخل حقل كتابة) يفتح صفحة المبيعات تلقائيًا ويضيف المنتج للفاتورة الحالية.
+          عند التعطيل: يعمل النظام بالطريقة العادية فقط (بحث يدوي عن المنتج).
+        </p>
+      </div>
+    </section>
+
     <div class="grid-2">
 
       <section class="card reveal d4" aria-labelledby="t-invset">
@@ -3446,6 +3468,11 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
 
 <style>
 /* قواعد مكملة للدمج */
+.p-row.bc-flash{animation:bcFlash 1s ease;border-radius:14px}
+@keyframes bcFlash{
+  0%{box-shadow:0 0 0 2px var(--brand,#3b82f6) inset;background:rgba(59,130,246,.14)}
+  100%{box-shadow:0 0 0 0 transparent inset;background:transparent}
+}
 .t-id{display:inline-flex;align-items:center;gap:10px}
 .stats-grid>.card:nth-child(1){animation-delay:.18s}
 .stats-grid>.card:nth-child(2){animation-delay:.24s}
@@ -3551,6 +3578,25 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
 </div>
 
 <!-- ═════════ نافذة إضافة/تعديل منتج ═════════ -->
+<div class="modal-overlay" id="bcNotFoundModal" role="dialog" aria-modal="true" aria-labelledby="bcnfTitle">
+  <div class="modal">
+    <div class="modal-icon"><svg><use href="#i-barcode"/></svg></div>
+    <h3 id="bcnfTitle">المنتج غير موجود</h3>
+    <p class="modal-sub">لا يوجد منتج في المخزون بالباركود: <b dir="ltr" id="bcnfCode" style="font-family:monospace"></b></p>
+    <div class="modal-actions" style="flex-direction:column;gap:10px">
+      <button class="btn btn-primary" id="bcnfAdd" type="button" style="width:100%">
+        <svg><use href="#i-plus"/></svg>
+        إضافة المنتج
+      </button>
+      <button class="btn btn-ghost" id="bcnfSearch" type="button" style="width:100%">
+        <svg><use href="#i-search"/></svg>
+        البحث يدويًا
+      </button>
+      <button class="btn btn-ghost plain" data-close type="button" style="width:100%">إلغاء</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="productModal" role="dialog" aria-modal="true" aria-labelledby="pmTitle">
   <div class="modal" style="max-width:720px;max-height:92vh;overflow-y:auto">
     <div class="modal-icon"><svg><use href="#i-db"/></svg></div>
@@ -4685,22 +4731,47 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
     var qEl    = row.querySelector('.q');
     var st     = { product: null, units: [] };
 
-    var picker = productPicker({
-      input: input, panel: panel, dd: dd,
-      onPick: function(p){
-        st.product = p;
-        st.units = [];
-        input.value = p.name;
-        wInput.value = money(p.purchasePrice);
-        if(!toNum(sInput.value)) sInput.value = money(p.salePrice);
-        applyKind();
-        updateTotals();
+    function selectProduct(p, opts){
+      st.product = p;
+      st.units = [];
+      input.value = p.name;
+      wInput.value = money(p.purchasePrice);
+      if(!toNum(sInput.value) || !(opts && opts.keepSale)) sInput.value = money(p.salePrice);
+      applyKind();
+      updateTotals();
+      if(!(opts && opts.silent)){
         sInput.focus();
         sInput.select();
-      },
+      }
+    }
+    row._selectProduct = selectProduct;
+
+    var picker = productPicker({
+      input: input, panel: panel, dd: dd,
+      onPick: function(p){ selectProduct(p); },
       onType: function(){
         /* كتابة حرة = صنف حر بدون مخزون */
         if(st.product){ st.product = null; st.units = []; applyKind(); updateTotals(); }
+      }
+    });
+
+    /* دعم مسح الباركود مباشرة داخل حقل المنتج: كتابة الباركود ثم Enter تختار المنتج تلقائيًا
+       (قارئ الباركود التقليدي يرسل الأرقام ثم Enter) */
+    input.addEventListener('keydown', function(e){
+      if(e.key !== 'Enter') return;
+      var v = input.value.trim();
+      if(!v || (st.product && st.product.name === v)) return;
+      var exact = App.state.products.find(function(p){ return p.active && p.barcode && p.barcode === v; });
+      if(!exact) return;
+      e.preventDefault();
+      picker.close();
+      selectProduct(exact);
+      /* أكمل المسح السريع: أضف صفًا جديدًا جاهزًا للباركود التالي (للمنتجات غير الهواتف) */
+      if(exact.kind !== 'phone'){
+        var nr = createRow();
+        rowsWrap.appendChild(nr);
+        syncSingle();
+        nr.querySelector('.prod-input').focus();
       }
     });
 
@@ -5608,11 +5679,15 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
 
   /* ───── نافذة منتج جديد/تعديل ───── */
   var productModal = $('#productModal');
+  productModal.addEventListener('click', function(e){
+    if(e.target === productModal || e.target.closest('[data-close]')) pmFromScanBarcode = null;
+  });
   var pmEditingId = null;
   var pmCatSel = null;
   var pmImage = null;
+  var pmFromScanBarcode = null;   /* باركود بانتظار الإضافة التلقائية للفاتورة بعد إنشاء المنتج */
 
-  $('#addProductBtn').addEventListener('click', function(){ openProductModal(null); });
+  $('#addProductBtn').addEventListener('click', function(){ pmFromScanBarcode = null; openProductModal(null); });
 
   function fillPmCats(selectedId){
     pmCatSel = selectedId || null;
@@ -5633,7 +5708,7 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
     });
   }
 
-  function openProductModal(p){
+  function openProductModal(p, prefillBarcode){
     pmEditingId = p ? p.id : null;
     pmImage = p ? p.image : null;
     $('#pmTitle').textContent = p ? 'تعديل المنتج' : 'منتج جديد';
@@ -5647,7 +5722,7 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
     $('#pmPurchase').value = p ? (p.purchasePrice ? money(p.purchasePrice) : '') : '';
     $('#pmSale').value = p ? (p.salePrice ? money(p.salePrice) : '') : '';
     $('#pmMinStock').value = p ? p.minStock : ((App.state.settings && App.state.settings.default_min_stock) || 3);
-    $('#pmBarcode').value = p ? (p.barcode || '') : '';
+    $('#pmBarcode').value = p ? (p.barcode || '') : (prefillBarcode || '');
     $('#pmQty').value = '';
     $('#pmModel').value = p ? (p.model || '') : '';
     $('#pmColor').value = p ? (p.color || '') : '';
@@ -5725,6 +5800,8 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
       if(q0 > 0) body.qty = q0;
     }
     var btn = this; btn.disabled = true;
+    var fromScanCode = !pmEditingId ? pmFromScanBarcode : null;
+    pmFromScanBarcode = null;
     try{
       if(pmEditingId){
         await apiPut('/inventory/products/' + pmEditingId, body);
@@ -5735,6 +5812,15 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
       }
       productModal.classList.remove('show');
       await reload(); renderAll();
+      /* المنتج أُنشئ من تدفق مسح باركود غير موجود سابقًا — أضفه للفاتورة الحالية مباشرة */
+      if(fromScanCode){
+        var created = findByBarcode(fromScanCode);
+        if(created){
+          navigate('sales', false);
+          addOrIncrementProductInSale(created);
+          showToast('تمت إضافة "' + created.name + '" لفاتورة البيع الحالية', 'success');
+        }
+      }
     }catch(err){ apiFail(err); }
     finally{ btn.disabled = false; }
   });
@@ -6958,6 +7044,8 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
     $('#shopAddressInput').value = st.shop_address || '';
     $('#invoiceFooterInput').value = st.invoice_footer || '';
     $('#minStockInput').value = st.default_min_stock != null ? st.default_min_stock : 3;
+    $('#bcQuickSaleToggle').checked = st.barcode_quick_sale !== false;
+    $('#bcQuickSaleLbl').textContent = st.barcode_quick_sale !== false ? '🟢 مفعل' : '⚪ غير مفعل';
     if(st.shop_logo){
       $('#shopLogoImg').src = st.shop_logo;
       $('#shopLogoImg').hidden = false;
@@ -7135,6 +7223,22 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
     finally{ btn.disabled = false; }
   });
 
+  /* وضع البيع السريع بالباركود — يُحفظ فورًا عند التبديل ولا يختفي بعد تحديث الصفحة */
+  $('#bcQuickSaleToggle').addEventListener('change', async function(){
+    var val = this.checked;
+    var toggle = this;
+    toggle.disabled = true;
+    try{
+      var res = await apiPut('/settings', { barcodeQuickSale: val });
+      App.state.settings = Object.assign({}, App.state.settings, res.settings);
+      $('#bcQuickSaleLbl').textContent = val ? '🟢 مفعل' : '⚪ غير مفعل';
+      showToast(val ? 'تم تفعيل وضع البيع السريع بالباركود' : 'تم تعطيل وضع البيع السريع بالباركود', 'info');
+    }catch(err){
+      toggle.checked = !val;
+      apiFail(err);
+    }finally{ toggle.disabled = false; }
+  });
+
   /* إعدادات المخزون والدفع */
   $('#invSetSaveBtn').addEventListener('click', async function(){
     var btn = this; btn.disabled = true;
@@ -7216,6 +7320,122 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
     }catch(err){ apiFail(err); }
     finally{ btn.disabled = false; }
   });
+
+  /* ═══════════════════════════════════════════════════════════════════
+     المسح الشامل بالباركود (Global Barcode Listener)
+     يعامل قارئ الباركود USB/Bluetooth كـ Keyboard Wedge: سلسلة أرقام/حروف
+     سريعة جدًا تنتهي بـEnter. يعمل من أي صفحة دون فتح المبيعات أو الضغط
+     على أي زر، ودون التأثير على الكتابة الطبيعية داخل حقول الإدخال.
+     ═══════════════════════════════════════════════════════════════════ */
+  var bcNotFoundModal = $('#bcNotFoundModal');
+  var bcBuffer = '', bcLastTime = 0;
+  var BC_MAX_GAP = 45;   /* أقصى فارق زمني (مللي ثانية) بين ضغطتين ليُعتبر مسحًا آليًا لا كتابة بشرية */
+  var BC_MIN_LEN = 4;    /* أقل طول مقبول للباركود */
+
+  function quickSaleEnabled(){
+    return !App.state.settings || App.state.settings.barcode_quick_sale !== false;
+  }
+  function isEditableFocus(){
+    var el = document.activeElement;
+    if(!el) return false;
+    var tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+  }
+  function findByBarcode(code){
+    var c = String(code || '').trim();
+    if(!c) return null;
+    return App.state.products.find(function(p){ return p.active && p.barcode && p.barcode === c; }) || null;
+  }
+  function flashRow(row){
+    row.scrollIntoView({behavior:'smooth', block:'center'});
+    row.classList.remove('bc-flash');
+    void row.offsetWidth;
+    row.classList.add('bc-flash');
+  }
+  /* يضيف منتجًا للفاتورة الجارية: يزيد الكمية إن كان موجودًا بالفعل بنفس الصنف،
+     وإلا يملأ صفًا فارغًا أو يضيف صفًا جديدًا. لا يُنشئ فاتورة جديدة أبدًا طالما
+     البيع لم يُسجَّل — فقط يعمل على نفس صفوف rowsWrap الحالية. */
+  function addOrIncrementProductInSale(p){
+    exitEdit();
+    var rows = rowsWrap.querySelectorAll('.p-row');
+    if(p.kind !== 'phone'){
+      for(var i = 0; i < rows.length; i++){
+        var d = rows[i]._getData();
+        if(d.product && String(d.product.id) === String(p.id)){
+          var qEl = rows[i].querySelector('.q');
+          qEl.textContent = Math.min(9999, (+qEl.textContent || 0) + 1);
+          updateTotals();
+          flashRow(rows[i]);
+          return rows[i];
+        }
+      }
+    }
+    var target = null;
+    for(var j = 0; j < rows.length; j++){
+      var dd = rows[j]._getData();
+      if(!dd.name && !dd.product){ target = rows[j]; break; }
+    }
+    if(!target){ target = createRow(); rowsWrap.appendChild(target); }
+    syncSingle();
+    target._selectProduct(p, { silent: true });
+    flashRow(target);
+    return target;
+  }
+  function showBarcodeNotFound(code){
+    $('#bcnfCode').textContent = code;
+    bcNotFoundModal.dataset.code = code;
+    bcNotFoundModal.classList.add('show');
+  }
+  $('#bcnfAdd').addEventListener('click', function(){
+    var code = bcNotFoundModal.dataset.code || '';
+    bcNotFoundModal.classList.remove('show');
+    pmFromScanBarcode = code;
+    openProductModal(null, code);
+  });
+  $('#bcnfSearch').addEventListener('click', function(){
+    var code = bcNotFoundModal.dataset.code || '';
+    bcNotFoundModal.classList.remove('show');
+    navigate('inventory', false);
+    setTimeout(function(){
+      var el = $('#invSearch');
+      if(el){ el.value = code; el.focus(); el.dispatchEvent(new Event('input')); }
+    }, 150);
+  });
+
+  function handleBarcodeScan(code){
+    if(!App.ready) return;
+    var p = findByBarcode(code);
+    navigate('sales', false);
+    if(!p){ showBarcodeNotFound(code); return; }
+    if(p.kind !== 'phone' && p.qty <= 0){
+      showToast('المنتج غير متوفر في المخزون: ' + p.name, 'danger');
+    }
+    addOrIncrementProductInSale(p);
+  }
+
+  document.addEventListener('keydown', function(e){
+    if(!quickSaleEnabled()){ bcBuffer = ''; return; }
+    if(e.ctrlKey || e.altKey || e.metaKey){ bcBuffer = ''; return; }
+
+    var now = Date.now();
+    var gap = now - bcLastTime;
+    bcLastTime = now;
+
+    if(e.key === 'Enter'){
+      var code = bcBuffer;
+      bcBuffer = '';
+      if(code.length < BC_MIN_LEN) return;
+      if(isEditableFocus()) return;   /* اترك الحقول تتصرف بشكل طبيعي دون أي تدخل */
+      e.preventDefault();
+      handleBarcodeScan(code);
+      return;
+    }
+    if(e.key.length === 1){
+      if(gap > BC_MAX_GAP) bcBuffer = '';   /* فارق كبير = كتابة بشرية عادية، ابدأ سلسلة جديدة */
+      bcBuffer += e.key;
+      if(bcBuffer.length > 40) bcBuffer = bcBuffer.slice(-40);
+    }
+  }, true);
 
   /* ═══════════ الإقلاع ═══════════ */
   (async function(){
