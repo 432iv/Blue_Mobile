@@ -1,363 +1,544 @@
 "use strict";
 /* ═══════════════════════════════════════════════════════════════════
-   /api/settings · /api/bootstrap · /api/payment-methods
-   /api/backup (نسخ احتياطي) · /api/backup/restore (استرجاع)
-   /api/import (استيراد نسخة المتصفح القديمة) · /api/data (حذف الكل)
+   /api/inventory — المخزون
+   منتجات (هواتف/إكسسوارات) + تصنيفات + وحدات IMEI + حركة المخزون + الجرد
+   كل تغيير كمية يمر عبر حركة مخزون موثقة.
    ═══════════════════════════════════════════════════════════════════ */
 const express = require("express");
 const db = require("../db");
 const ledger = require("../lib/ledger");
-const { wrap, HttpError, cleanText, isoDate, dayNameFor, toMoney, toInt } = require("../lib/http");
-const { mapDay, mapNote, mapInvoice, mapProduct, mapCategory, mapPurchase, mapExpense, mapCashMove } = require("../lib/map");
-const { normalizeName } = require("../lib/names");
+const { wrap, HttpError, cleanText, toInt, toMoney } = require("../lib/http");
+const { mapProduct, mapCategory, mapUnit, mapStockMove, mapStocktake } = require("../lib/map");
 
 const router = express.Router();
+const r2 = ledger.r2;
 
-/* ───────────── الإعدادات (تتبع الحساب بين الأجهزة) ───────────── */
-const SETTINGS_COLS = `lang, theme, shop_name, shop_logo, shop_phone, shop_address,
-                       invoice_footer, currency, default_min_stock, barcode_quick_sale`;
-async function readSettings(userId) {
-  const { rows } = await db.query(`SELECT ${SETTINGS_COLS} FROM settings WHERE user_id = $1`, [userId]);
-  if (rows.length) return rows[0];
-  /* صف الإعدادات يُنشأ عند أول تسجيل دخول */
-  await db.query("INSERT INTO settings (user_id) VALUES ($1) ON CONFLICT DO NOTHING", [userId]);
-  const again = await db.query(`SELECT ${SETTINGS_COLS} FROM settings WHERE user_id = $1`, [userId]);
-  return again.rows[0] || { lang: "ar", theme: "dark" };
+const PRODUCT_SELECT = `
+  SELECT p.*, c.name AS category_name FROM products p
+  LEFT JOIN categories c ON c.id = p.category_id`;
+
+async function getProduct(client, id, forUpdate) {
+  const { rows } = await client.query(
+    `SELECT p.*, c.name AS category_name FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+     WHERE p.id = $1 ${forUpdate ? "FOR UPDATE OF p" : ""}`, [id]);
+  if (!rows.length) throw new HttpError(404, "product_not_found", "Product not found");
+  return rows[0];
 }
 
-router.get("/settings", wrap(async (req, res) => {
-  res.json({ settings: await readSettings(req.user.id) });
-}));
+async function assertBarcodeFree(client, barcode, exceptId) {
+  const code = String(barcode || "").trim();
+  if (!code) return null;
+  const { rows } = await client.query(
+    `SELECT id FROM products WHERE barcode = $1 AND id <> COALESCE($2::bigint, 0)
+     UNION ALL
+     SELECT product_id FROM product_barcodes WHERE barcode = $1 AND product_id <> COALESCE($2::bigint, 0)`,
+    [code, exceptId || null]);
+  if (rows.length) throw new HttpError(409, "barcode_taken", "هذا الباركود مستخدم لمنتج آخر");
+  return code || null;
+}
 
-router.put("/settings", wrap(async (req, res) => {
-  const b = req.body || {};
-  const cur = await readSettings(req.user.id);
-  const lang = b.lang === "en" ? "en" : "ar";
-  const theme = b.theme === "light" ? "light" : "dark";
-  const shopName = b.shopName !== undefined ? (b.shopName ? cleanText(b.shopName, { field: "shopName", max: 60, required: false }) : "Blue Mobile") : cur.shop_name;
-  const shopLogo = b.shopLogo !== undefined ? (b.shopLogo ? String(b.shopLogo).slice(0, 500000) : null) : cur.shop_logo;
-  const shopPhone = b.shopPhone !== undefined ? (b.shopPhone ? cleanText(b.shopPhone, { field: "shopPhone", max: 40, required: false }) : null) : cur.shop_phone;
-  const shopAddress = b.shopAddress !== undefined ? (b.shopAddress ? cleanText(b.shopAddress, { field: "shopAddress", max: 120, required: false }) : null) : cur.shop_address;
-  const invoiceFooter = b.invoiceFooter !== undefined ? (b.invoiceFooter ? cleanText(b.invoiceFooter, { field: "invoiceFooter", max: 200, required: false }) : null) : cur.invoice_footer;
-  const currency = b.currency !== undefined ? (b.currency ? cleanText(b.currency, { field: "currency", max: 8, required: false }) : "د.ل") : cur.currency;
-  const defaultMinStock = b.defaultMinStock !== undefined ? toInt(b.defaultMinStock, { field: "defaultMinStock", min: 0, max: 1000 }) : cur.default_min_stock;
-  const barcodeQuickSale = b.barcodeQuickSale !== undefined ? !!b.barcodeQuickSale : cur.barcode_quick_sale;
+/* مزامنة عمود products.barcode (النموذج البسيط) مع جدول product_barcodes (مصدر الحقيقة
+   لكل عمليات البحث ومنع التكرار)، حتى تبقى الطريقتان متوافقتين تمامًا دون تكرار أو تضارب. */
+async function syncDefaultBarcode(client, productId, oldBarcode, newBarcode, wholesalePrice, salePrice) {
+  const oldCode = oldBarcode ? String(oldBarcode).trim() : "";
+  const newCode = newBarcode ? String(newBarcode).trim() : "";
+  if (oldCode && oldCode !== newCode) {
+    await client.query("DELETE FROM product_barcodes WHERE product_id = $1 AND barcode = $2", [productId, oldCode]);
+  }
+  if (newCode) {
+    await client.query(
+      `INSERT INTO product_barcodes (product_id, barcode, wholesale_price, sale_price)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (barcode) DO UPDATE SET wholesale_price = $3, sale_price = $4`,
+      [productId, newCode, wholesalePrice, salePrice]);
+  }
+}
 
-  const { rows } = await db.query(
-    `INSERT INTO settings (user_id, ${SETTINGS_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-     ON CONFLICT (user_id) DO UPDATE SET lang=$2, theme=$3, shop_name=$4, shop_logo=$5,
-       shop_phone=$6, shop_address=$7, invoice_footer=$8, currency=$9, default_min_stock=$10,
-       barcode_quick_sale=$11, updated_at=now()
-     RETURNING ${SETTINGS_COLS}`,
-    [req.user.id, lang, theme, shopName, shopLogo, shopPhone, shopAddress, invoiceFooter, currency, defaultMinStock, barcodeQuickSale]);
-  res.json({ settings: rows[0] });
-}));
+/* تنظيف قائمة IMEI: إزالة الفراغات والتكرار */
+function cleanImeis(raw) {
+  const list = Array.isArray(raw) ? raw : String(raw || "").split(/[\n,،]/);
+  const out = [];
+  for (let v of list) {
+    v = String(v || "").replace(/\s+/g, "").trim();
+    if (v && !out.includes(v)) out.push(v.slice(0, 20));
+  }
+  return out;
+}
 
-/* ───────────── طرق الدفع (تفعيل/تعطيل) ───────────── */
-router.get("/payment-methods", wrap(async (_req, res) => {
-  const { rows } = await db.query("SELECT code, sort_order, active FROM payment_methods ORDER BY sort_order, code");
-  res.json({ methods: rows.map(r => ({ code: r.code, sortOrder: r.sort_order, active: !!r.active })) });
-}));
-router.put("/payment-methods", wrap(async (req, res) => {
-  const code = String(req.body.code || "");
-  if (code === "cash") throw new HttpError(400, "cash_locked", "النقد لا يمكن تعطيله");
-  const active = !!req.body.active;
-  const { rows } = await db.query(
-    "UPDATE payment_methods SET active = $1 WHERE code = $2 RETURNING code, active", [active, code]);
-  if (!rows.length) throw new HttpError(404, "payment_invalid", "طريقة دفع غير معروفة");
-  res.json({ method: { code: rows[0].code, active: !!rows[0].active } });
-}));
+async function checkImeisFree(client, imeis, exceptUnitId) {
+  for (const imei of imeis) {
+    const { rows } = await client.query(
+      "SELECT id, product_id FROM phone_units WHERE imei = $1 AND id <> COALESCE($2::bigint, 0)", [imei, exceptUnitId || null]);
+    if (rows.length) throw new HttpError(409, "imei_taken", "الرقم التسلسلي IMEI " + imei + " مسجل مسبقاً");
+  }
+}
 
-/* ───────────── bootstrap: المنظومة كاملة في طلب واحد ───────────── */
-router.get("/bootstrap", wrap(async (req, res) => {
-  const [settings, days, invoices, purchases, expenses, products, categories,
-         names, notes, cash, dashboard] = await Promise.all([
-    readSettings(req.user.id),
-    db.query(`SELECT * FROM days ORDER BY day_date DESC LIMIT 400`),
-    db.query("SELECT * FROM invoices ORDER BY sale_time DESC, id DESC LIMIT 400"),
-    db.query(`SELECT p.*, (SELECT count(*) FROM purchase_items x WHERE x.purchase_id = p.id) AS items_count
-                FROM purchases p ORDER BY p.created_at DESC, p.id DESC LIMIT 200`),
-    db.query("SELECT * FROM expenses ORDER BY created_at DESC, id DESC LIMIT 500"),
-    db.query(`SELECT p.*, c.name AS category_name FROM products p
-                LEFT JOIN categories c ON c.id = p.category_id
-               ORDER BY p.is_active DESC, p.name LIMIT 3000`),
-    db.query("SELECT * FROM categories ORDER BY sort_order, id"),
-    db.query("SELECT name FROM product_names ORDER BY usage_count DESC, last_used_at DESC LIMIT 2000"),
-    db.query("SELECT * FROM notes ORDER BY note_time DESC, id DESC LIMIT 2000"),
-    db.query(`SELECT COALESCE(SUM(CASE WHEN direction='in' THEN amount ELSE -amount END),0) AS balance
-                FROM cash_movements WHERE method IS NULL OR method='cash'`),
-    db.query(`SELECT
-                (SELECT COALESCE(SUM(total - refunded),0) FROM invoices WHERE status <> 'cancelled') AS sales,
-                (SELECT COALESCE(SUM(profit - refunded_profit),0) FROM invoices WHERE status <> 'cancelled') AS profit,
-                (SELECT COALESCE(SUM(total),0) FROM purchases WHERE status='completed') AS purchases,
-                (SELECT COALESCE(SUM(amount),0) FROM expenses) AS expenses`)
+/* إضافة وحدات هاتف ( placeholders أو بـ IMEI ) */
+async function createUnits(client, productId, imeis, purchaseItemId, dayId, reason) {
+  for (const imei of imeis) {
+    await client.query(
+      "INSERT INTO phone_units (product_id, imei, purchase_item_id) VALUES ($1,$2,$3)",
+      [productId, imei || null, purchaseItemId || null]);
+  }
+  if (imeis.length) {
+    await client.query("UPDATE products SET quantity = quantity + $1, updated_at = now() WHERE id = $2", [imeis.length, productId]);
+    await ledger.recordStockMove(client, {
+      productId, qtyIn: imeis.length, reason, refType: purchaseItemId ? "purchase" : "manual",
+      note: "وحدات IMEI (" + imeis.length + ")", dayId
+    });
+  }
+}
+
+/* ───────────── المخزون كاملاً + التصنيفات ───────────── */
+router.get("/", wrap(async (_req, res) => {
+  const [products, categories] = await Promise.all([
+    db.query(PRODUCT_SELECT + " ORDER BY p.is_active DESC, p.name"),
+    db.query("SELECT * FROM categories ORDER BY sort_order, id")
   ]);
-
-  const itemRows = invoices.rows.length ? await db.query(
-    "SELECT * FROM invoice_items WHERE invoice_id = ANY($1::bigint[]) ORDER BY id",
-    [invoices.rows.map(r => r.id)]) : { rows: [] };
-  const byInv = new Map();
-  for (const it of itemRows.rows) {
-    if (!byInv.has(String(it.invoice_id))) byInv.set(String(it.invoice_id), []);
-    byInv.get(String(it.invoice_id)).push(it);
-  }
-
-  /* إجماليات كل يوم (لقطة ثابتة للمغلقة) */
-  const daysOut = [];
-  for (const r of days.rows) {
-    const { totals } = await ledger.daySummaryForApi(r.id);
-    daysOut.push(Object.assign(mapDay(r), { totals, netProfit: totals.netProfit }));
-  }
-
-  const g = dashboard.rows[0];
-  res.json({
-    user: { id: String(req.user.id), username: req.user.username, email: req.user.email },
-    settings,
-    days: daysOut,
-    sessions: daysOut,
-    invoices: invoices.rows.map(r => mapInvoice(r, byInv.get(String(r.id)) || [])),
-    purchases: purchases.rows.map(r => mapPurchase(r, null)),
-    expenses: expenses.rows.map(mapExpense),
-    products: products.rows.map(mapProduct),
-    categories: categories.rows.map(r => ({ id: String(r.id), name: r.name, sortOrder: r.sort_order })),
-    notes: notes.rows.map(mapNote),
-    productNames: names.rows.map(r => r.name),
-    cashBalance: Number(cash.rows[0].balance),
-    grand: {
-      sales: ledger.r2(g.sales), profit: ledger.r2(g.profit),
-      purchases: ledger.r2(g.purchases), expenses: ledger.r2(g.expenses),
-      netProfit: ledger.r2(g.profit - g.expenses)
-    },
-    serverTime: new Date().toISOString()
-  });
+  res.json({ products: products.rows.map(mapProduct), categories: categories.rows.map(mapCategory) });
 }));
 
-/* ───────────── النسخ الاحتياطي الكامل ───────────── */
-router.get("/backup", wrap(async (_req, res) => {
-  const [settings, days, daySummaries, invoices, invoiceItems, returns, purchases, purchaseItems,
-         expenses, cashMoves, products, categories, units, stockMoves, stocktakes, stocktakeItems, names] =
-    await Promise.all([
-      db.query("SELECT * FROM settings"),
-      db.query("SELECT * FROM days ORDER BY day_date"),
-      db.query("SELECT * FROM day_summaries"),
-      db.query("SELECT * FROM invoices ORDER BY id"),
-      db.query("SELECT * FROM invoice_items ORDER BY id"),
-      db.query("SELECT * FROM sale_returns ORDER BY id"),
-      db.query("SELECT * FROM purchases ORDER BY id"),
-      db.query("SELECT * FROM purchase_items ORDER BY id"),
-      db.query("SELECT * FROM expenses ORDER BY id"),
-      db.query("SELECT * FROM cash_movements ORDER BY id"),
-      db.query("SELECT * FROM products ORDER BY id"),
-      db.query("SELECT * FROM categories ORDER BY id"),
-      db.query("SELECT * FROM phone_units ORDER BY id"),
-      db.query("SELECT * FROM stock_movements ORDER BY id"),
-      db.query("SELECT * FROM stocktakes ORDER BY id"),
-      db.query("SELECT * FROM stocktake_items ORDER BY id"),
-      db.query("SELECT * FROM product_names ORDER BY id")
-    ]);
-  res.json({
-    app: "Blue Mobile",
-    schema: 4,
-    exportedAt: new Date().toISOString(),
-    data: {
-      settings: settings.rows, days: days.rows, day_summaries: daySummaries.rows,
-      invoices: invoices.rows, invoice_items: invoiceItems.rows, sale_returns: returns.rows,
-      purchases: purchases.rows, purchase_items: purchaseItems.rows,
-      expenses: expenses.rows, cash_movements: cashMoves.rows,
-      products: products.rows, categories: categories.rows, phone_units: units.rows,
-      stock_movements: stockMoves.rows, stocktakes: stocktakes.rows, stocktake_items: stocktakeItems.rows,
-      product_names: names.rows
+/* ───────────── بحث سريع للمنتجات (نماذج البيع والشراء) ───────────── */
+router.get("/search", wrap(async (req, res) => {
+  const q = String(req.query.q || "").replace(/\s+/g, " ").trim();
+  const limit = Math.min(parseInt(req.query.limit || "10", 10) || 10, 25);
+  if (!q) {
+    const { rows } = await db.query(
+      PRODUCT_SELECT + " WHERE p.is_active AND p.quantity > 0 ORDER BY p.updated_at DESC LIMIT $1", [limit]);
+    return res.json({ products: rows.map(mapProduct) });
+  }
+  const like = "%" + q.toLowerCase() + "%";
+  const { rows } = await db.query(
+    `SELECT p.*, c.name AS category_name,
+            (CASE
+               WHEN lower(p.name) = $1 THEN 0
+               WHEN lower(p.name) LIKE $2 THEN 1
+               WHEN lower(p.barcode) = $1 THEN 0
+               WHEN lower(c.name) LIKE $2 THEN 2
+               WHEN lower(p.model) LIKE $2 THEN 2
+               WHEN EXISTS (SELECT 1 FROM phone_units u WHERE u.product_id = p.id AND (lower(u.imei) LIKE $2 OR lower(u.serial) LIKE $2)) THEN 1
+               ELSE 3 END) AS rank
+       FROM products p LEFT JOIN categories c ON c.id = p.category_id
+      WHERE p.is_active AND (lower(p.name) LIKE $2 OR lower(p.barcode) LIKE $2
+             OR lower(p.model) LIKE $2 OR lower(c.name) LIKE $2
+             OR EXISTS (SELECT 1 FROM phone_units u WHERE u.product_id = p.id AND (lower(u.imei) LIKE $2 OR lower(u.serial) LIKE $2)))
+      ORDER BY rank, p.name LIMIT $3`, [q.toLowerCase(), like, limit]);
+  res.json({ products: rows.map(mapProduct) });
+}));
+
+/* ───────────── إضافة منتج ───────────── */
+router.post("/products", wrap(async (req, res) => {
+  const product = await db.tx(async client => {
+    const name = cleanText(req.body.name, { field: "name", max: 120 });
+    const kind = req.body.kind === "phone" ? "phone" : "accessory";
+    const categoryId = req.body.categoryId ? toInt(req.body.categoryId, { field: "categoryId", min: 1 }) : null;
+    if (categoryId) {
+      const c = await client.query("SELECT id FROM categories WHERE id = $1", [categoryId]);
+      if (!c.rows.length) throw new HttpError(404, "category_not_found", "التصنيف غير موجود");
     }
-  });
-}));
+    const barcode = await assertBarcodeFree(client, req.body.barcode, null);
+    const purchasePrice = toMoney(req.body.purchasePrice ?? 0, { field: "purchasePrice" });
+    const salePrice = toMoney(req.body.salePrice ?? 0, { field: "salePrice" });
+    const minStock = toInt(req.body.minStock ?? 3, { field: "minStock", min: 0, max: 100000 });
 
-/* ───────────── الاسترجاع ───────────── */
-router.post("/backup/restore", wrap(async (req, res) => {
-  if (String(req.body && req.body.confirm) !== "RESTORE") {
-    throw new HttpError(400, "confirm_required", 'Send { "confirm": "RESTORE" }');
-  }
-  const data = req.body.data;
-  if (!data || typeof data !== "object" || !Array.isArray(data.days) || !Array.isArray(data.invoices)) {
-    throw new HttpError(400, "backup_invalid", "ملف النسخة الاحتياطية غير صالح");
-  }
-  const t = (name) => Array.isArray(data[name]) ? data[name] : [];
+    const { rows } = await client.query(
+      `INSERT INTO products (name, category_id, kind, barcode, image_url, model, color, storage,
+                             purchase_price, sale_price, min_stock)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [name, categoryId, kind, barcode,
+       req.body.image ? String(req.body.image).slice(0, 300000) : null,
+       req.body.model ? cleanText(req.body.model, { field: "model", max: 60, required: false }) : null,
+       req.body.color ? cleanText(req.body.color, { field: "color", max: 40, required: false }) : null,
+       req.body.storage ? cleanText(req.body.storage, { field: "storage", max: 40, required: false }) : null,
+       purchasePrice, salePrice, minStock]);
+    const prod = rows[0];
+    await syncDefaultBarcode(client, prod.id, null, barcode, purchasePrice, salePrice);
 
-  await db.tx(async client => {
-    /* مسح شامل ثم إدراج */
-    await client.query(`TRUNCATE sale_returns, invoice_items, invoices, purchase_items, purchases,
-                        expenses, cash_movements, stocktake_items, stocktakes, stock_movements,
-                        phone_units, products, categories, day_summaries, notes, days, product_names
-                        RESTART IDENTITY CASCADE`);
-    /* الأعمدة المولّدة (GENERATED) تُستبعد من الإدراج — تُحسب تلقائياً */
-    const GENERATED = {
-      invoices: ["total", "profit"],
-      invoice_items: ["line_total", "line_cost"],
-      purchase_items: ["line_total"],
-      stocktake_items: ["diff"]
-    };
-    const ins = async (table, rows, cols) => {
-      const skip = GENERATED[table] || [];
-      console.log("[restore]", table, rows.length, "rows");
-      for (const r of rows) {
-        const keys = cols.filter(c => !skip.includes(c) && r[c] !== undefined);
-        if (!keys.length) continue;
-        const vals = keys.map(c => {
-          const v = r[c];
-          if (Array.isArray(v)) return v;                    /* text[] مثل imeis — تُمرر كما هي */
-          if (v !== null && typeof v === "object" && !(v instanceof Date)) {
-            return JSON.stringify(v);                        /* jsonb مثل snapshot */
-          }
-          return v;
+    const day = await ledger.getOpenDay(client);
+    if (kind === "phone") {
+      const imeis = cleanImeis(req.body.imeis);
+      await checkImeisFree(client, imeis, null);
+      const extra = imeis.length ? 0 : Math.max(0, toInt(req.body.qty ?? 0, { field: "qty", min: 0 }));
+      const all = imeis.concat(Array(extra).fill(""));
+      if (all.length) await createUnits(client, prod.id, all, null, day ? day.id : null, "initial");
+    } else {
+      const qty = toInt(req.body.qty ?? 0, { field: "qty", min: 0, max: 100000 });
+      if (qty > 0) {
+        await client.query("UPDATE products SET quantity = $1 WHERE id = $2", [qty, prod.id]);
+        await ledger.recordStockMove(client, {
+          productId: prod.id, qtyIn: qty, reason: "initial",
+          note: "رصيد افتتاحي", dayId: day ? day.id : null
         });
-        await client.query(
-          `INSERT INTO ${table} (${keys.join(",")}) VALUES (${keys.map((_, i) => "$" + (i + 1)).join(",")})`, vals);
       }
-    };
-    await ins("categories", t("categories"), ["id", "name", "sort_order", "created_at"]);
-    await ins("days", t("days"), ["id", "day_date", "day_name", "status", "opened_at", "closed_at"]);
-    await ins("day_summaries", t("day_summaries"), ["day_id", "snapshot", "cash_balance", "created_at"]);
-    await ins("products", t("products"),
-      ["id", "name", "category_id", "kind", "barcode", "image_url", "model", "color", "storage",
-       "quantity", "purchase_price", "sale_price", "min_stock", "is_active", "created_at", "updated_at"]);
-    await ins("phone_units", t("phone_units"),
-      ["id", "product_id", "imei", "serial", "status", "purchase_item_id", "invoice_item_id", "created_at", "updated_at"]);
-    await ins("invoices", t("invoices"),
-      ["id", "day_id", "invoice_no", "payment_method", "debtor_name", "discount", "subtotal", "cost_total",
-       "refunded", "refunded_profit", "status", "notes", "sale_date", "sale_time", "created_at", "updated_at"]);
-    await ins("invoice_items", t("invoice_items"),
-      ["id", "invoice_id", "product_id", "product_name", "qty", "qty_returned",
-       "wholesale_price", "selling_price", "unit_id", "imei", "created_at"]);
-    await ins("sale_returns", t("sale_returns"),
-      ["id", "invoice_id", "item_id", "day_id", "qty", "amount", "profit_adjust", "reason", "returned_at"]);
-    await ins("purchases", t("purchases"),
-      ["id", "day_id", "purchase_no", "total", "paid", "notes", "purchase_date", "status", "created_at", "updated_at"]);
-    await ins("purchase_items", t("purchase_items"),
-      ["id", "purchase_id", "product_id", "product_name", "qty", "unit_cost", "imeis", "line_total", "created_at"]);
-    await ins("expenses", t("expenses"),
-      ["id", "day_id", "category", "amount", "expense_date", "notes", "created_at", "updated_at"]);
-    await ins("cash_movements", t("cash_movements"),
-      ["id", "day_id", "direction", "method", "category", "amount", "description", "ref_type", "ref_id", "moved_at", "created_at"]);
-    await ins("stock_movements", t("stock_movements"),
-      ["id", "product_id", "qty_in", "qty_out", "reason", "ref_type", "ref_id", "note", "day_id", "moved_at"]);
-    await ins("stocktakes", t("stocktakes"), ["id", "day_id", "note", "lines", "diff_lines", "created_at"]);
-    await ins("stocktake_items", t("stocktake_items"),
-      ["id", "stocktake_id", "product_id", "product_name", "system_qty", "counted_qty"]);
-    await ins("notes", t("notes"), ["id", "day_id", "note_text", "note_date", "note_time", "created_at"]);
-    await ins("product_names", t("product_names"), ["id", "name", "normalized_name", "usage_count", "last_used_at", "created_at"]);
-
-    /* مزامنة المتتاليات مع أكبر معرف مُدرج */
-    for (const seq of ["invoices_id_seq", "invoice_items_id_seq", "sale_returns_id_seq", "purchases_id_seq",
-                       "purchase_items_id_seq", "expenses_id_seq", "cash_movements_id_seq", "products_id_seq",
-                       "categories_id_seq", "phone_units_id_seq", "stock_movements_id_seq",
-                       "stocktakes_id_seq", "stocktake_items_id_seq", "days_id_seq", "notes_id_seq", "product_names_id_seq"]) {
-      const table = seq.replace("_id_seq", "");
-      await client.query(
-        `SELECT setval('${seq}', GREATEST((SELECT COALESCE(MAX(id), 0) FROM ${table}), 1))`);
     }
-    const maxInv = await client.query(
-      `SELECT COALESCE(MAX(NULLIF(regexp_replace(invoice_no, '\\D', '', 'g'), '')::bigint), 1) AS m FROM invoices`);
-    await client.query("SELECT setval('invoice_seq', $1)", [maxInv.rows[0].m]);
-    const maxPur = await client.query(
-      `SELECT COALESCE(MAX(NULLIF(regexp_replace(purchase_no, '\\D', '', 'g'), '')::bigint), 1) AS m FROM purchases`);
-    await client.query("SELECT setval('purchase_seq', $1)", [maxPur.rows[0].m]);
-    /* ضمان وجود التصنيفات الافتراضية بعد الاسترجاع */
-    await client.query(`INSERT INTO categories (name, sort_order) VALUES
-      ('هواتف', 1), ('إكسسوارات', 2), ('سماعات', 3), ('شواحن', 4),
-      ('حمايات', 5), ('بطاريات', 6), ('ذاكرة وتخزين', 7), ('أخرى', 8)
-      ON CONFLICT (name) DO NOTHING`);
+    return getProduct(client, prod.id, false);
   });
-  res.json({ ok: true, restored: true });
+  res.status(201).json({ product: mapProduct(product) });
 }));
 
-/* ───────────── استيراد بيانات النسخة القديمة (مرة واحدة) ───────────── */
-router.post("/import", wrap(async (req, res) => {
-  const existing = await db.query("SELECT (SELECT count(*) FROM invoices) s, (SELECT count(*) FROM days) d");
-  if (Number(existing.rows[0].s) > 0 || Number(existing.rows[0].d) > 0) {
-    throw new HttpError(409, "ledger_not_empty", "The server already holds ledger data");
-  }
-  const sessions = Array.isArray(req.body.sessions) ? req.body.sessions : [];
-  const sales = Array.isArray(req.body.sales) ? req.body.sales : [];
-  const notes = Array.isArray(req.body.notes) ? req.body.notes : [];
-  const names = Array.isArray(req.body.productNames) ? req.body.productNames : [];
+/* ───────────── تعديل منتج ───────────── */
+router.put("/products/:id(\\d+)", wrap(async (req, res) => {
+  const product = await db.tx(async client => {
+    const prod = await getProduct(client, req.params.id, true);
 
-  const counts = await db.tx(async client => {
-    const dayIdByOld = new Map();
-    for (const s of sessions) {
-      const date = isoDate(s.date);
-      const status = s.status === "open" ? "open" : "closed";
-      const { rows } = await client.query(
-        `INSERT INTO days (day_date, day_name, status, opened_at, closed_at)
-         VALUES ($1,$2,$3, COALESCE($4::timestamptz, now()), $5::timestamptz)
-         ON CONFLICT (day_date) DO UPDATE SET day_name = EXCLUDED.day_name
-         RETURNING id`,
-        [date, cleanText(s.dayName || dayNameFor(date), { field: "dayName", max: 40 }), status, s.startedAt || null, s.closedAt || null]);
-      dayIdByOld.set(String(s.id), rows[0].id);
+    const name = cleanText(req.body.name ?? prod.name, { field: "name", max: 120 });
+    const barcode = await assertBarcodeFree(client, req.body.barcode ?? prod.barcode, prod.id);
+    let categoryId = prod.category_id;
+    if (req.body.categoryId !== undefined) {
+      categoryId = req.body.categoryId ? toInt(req.body.categoryId, { field: "categoryId", min: 1 }) : null;
+      if (categoryId) {
+        const c = await client.query("SELECT id FROM categories WHERE id = $1", [categoryId]);
+        if (!c.rows.length) throw new HttpError(404, "category_not_found", "التصنيف غير موجود");
+      }
     }
-    for (const n of names) {
-      const name = String(n || "").replace(/\s+/g, " ").trim();
-      const norm = normalizeName(name);
-      if (!norm) continue;
-      await client.query(
-        `INSERT INTO product_names (name, normalized_name) VALUES ($1,$2)
-         ON CONFLICT (normalized_name) DO NOTHING`, [name, norm]);
+    let kind = prod.kind;
+    if (req.body.kind && req.body.kind !== prod.kind) {
+      const hasUnits = await client.query("SELECT count(*)::int AS n FROM phone_units WHERE product_id = $1", [prod.id]);
+      if (Number(hasUnits.rows[0].n) > 0) {
+        throw new HttpError(409, "kind_locked", "لا يمكن تغيير نوع منتج له وحدات IMEI مسجلة");
+      }
+      kind = req.body.kind === "phone" ? "phone" : "accessory";
     }
-    let saleCount = 0;
-    for (const s of [...sales].reverse()) {
-      const dayId = dayIdByOld.get(String(s.sessionId));
-      if (!dayId) continue;
-      const qty = Math.max(1, parseInt(s.qty, 10) || 1);
-      const price = Math.max(0, Number(s.price) || 0);
-      const wholesale = Math.max(0, Number(s.wholesale) || 0);
-      const payment = ["cash", "card", "unpaid"].includes(s.payment) ? s.payment : "cash";
-      const subtotal = Math.round(price * qty * 100) / 100;
-      const cost = Math.round(wholesale * qty * 100) / 100;
-      const inv = await client.query(
-        `INSERT INTO invoices (day_id, invoice_no, payment_method, subtotal, cost_total,
-                               sale_date, sale_time, created_at, updated_at)
-         VALUES ($1, 'INV-' || lpad(nextval('invoice_seq')::text, 5, '0'), $2,$3,$4,$5,
-                 COALESCE($6::timestamptz, now()), COALESCE($6::timestamptz, now()), now())
-         RETURNING id`, [dayId, payment, subtotal, cost, isoDate(s.date), s.time || null]);
-      await client.query(
-        `INSERT INTO invoice_items (invoice_id, product_name, qty, wholesale_price, selling_price)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [inv.rows[0].id, cleanText(s.product, { field: "product", max: 120 }), qty, wholesale, price]);
-      saleCount++;
-    }
-    let noteCount = 0;
-    for (const n of [...notes].reverse()) {
-      const dayId = dayIdByOld.get(String(n.sessionId));
-      const text = String(n.text || "").replace(/\s+/g, " ").trim();
-      if (!dayId || !text) continue;
-      await client.query(
-        `INSERT INTO notes (day_id, note_text, note_date, note_time)
-         VALUES ($1,$2,$3, COALESCE($4::timestamptz, now()))`,
-        [dayId, text, isoDate(n.date), n.time || null]);
-      noteCount++;
-    }
-    return { days: dayIdByOld.size, sales: saleCount, notes: noteCount, productNames: names.length };
+
+    const newPurchasePrice = toMoney(req.body.purchasePrice ?? prod.purchase_price, { field: "purchasePrice" });
+    const newSalePrice = toMoney(req.body.salePrice ?? prod.sale_price, { field: "salePrice" });
+    await client.query(
+      `UPDATE products SET name=$1, category_id=$2, kind=$3, barcode=$4,
+              image_url=$5, model=$6, color=$7, storage=$8,
+              purchase_price=$9, sale_price=$10, min_stock=$11, is_active=$12, updated_at=now()
+        WHERE id=$13`,
+      [name, categoryId, kind, barcode,
+       req.body.image !== undefined ? (req.body.image ? String(req.body.image).slice(0, 300000) : null) : prod.image_url,
+       req.body.model !== undefined ? (req.body.model ? cleanText(req.body.model, { field: "model", max: 60, required: false }) : null) : prod.model,
+       req.body.color !== undefined ? (req.body.color ? cleanText(req.body.color, { field: "color", max: 40, required: false }) : null) : prod.color,
+       req.body.storage !== undefined ? (req.body.storage ? cleanText(req.body.storage, { field: "storage", max: 40, required: false }) : null) : prod.storage,
+       newPurchasePrice, newSalePrice,
+       toInt(req.body.minStock ?? prod.min_stock, { field: "minStock", min: 0, max: 100000 }),
+       req.body.active === undefined ? prod.is_active : !!req.body.active,
+       prod.id]);
+    await syncDefaultBarcode(client, prod.id, prod.barcode, barcode, newPurchasePrice, newSalePrice);
+    return getProduct(client, prod.id, false);
   });
-  res.status(201).json({ imported: counts });
+  res.json({ product: mapProduct(product) });
 }));
 
-/* ───────────── منطقة الخطر: حذف كل البيانات ───────────── */
-router.delete("/data", wrap(async (req, res) => {
-  if (String(req.body && req.body.confirm) !== "DELETE") {
-    throw new HttpError(400, "confirm_required", 'Send { "confirm": "DELETE" }');
-  }
+/* ───────────── خريطة كل الباركودات (للبحث الفوري من المتصفح دون اتصال بالخادم) ───────────── */
+router.get("/barcodes", wrap(async (_req, res) => {
+  const { rows } = await db.query(
+    `SELECT pb.barcode, pb.product_id AS "productId",
+            pb.wholesale_price AS "wholesalePrice", pb.sale_price AS "salePrice",
+            p.name AS "productName", p.kind, p.quantity AS qty, p.is_active AS active
+       FROM product_barcodes pb JOIN products p ON p.id = pb.product_id
+      ORDER BY pb.id`);
+  res.json({
+    barcodes: rows.map(r => ({
+      barcode: r.barcode, productId: String(r.productId), productName: r.productName,
+      kind: r.kind, qty: Number(r.qty), active: r.active,
+      wholesalePrice: Number(r.wholesalePrice), salePrice: Number(r.salePrice)
+    }))
+  });
+}));
+
+/* ───────────── حفظ دفعة تسجيل منتجات جديدة بالباركود (وضع تسجيل المنتجات) ─────────────
+   منتج رئيسي واحد (جديد أو موجود بنفس الاسم بالضبط) + عدة مجموعات باركود، كل مجموعة
+   لها سعر جملة/بيع خاص بها، والكمية الإجمالية تُضاف على مستوى المنتج فقط. */
+router.post("/barcode-batches", wrap(async (req, res) => {
+  const product = await db.tx(async client => {
+    const name = cleanText(req.body.productName, { field: "productName", max: 120 });
+    const qty = toInt(req.body.qty ?? 0, { field: "qty", min: 0, max: 1000000 });
+    const groupsIn = Array.isArray(req.body.groups) ? req.body.groups : [];
+    if (!groupsIn.length) throw new HttpError(400, "no_barcodes", "لا توجد باركودات في هذه الدفعة");
+
+    const groups = [];
+    const allCodes = [];
+    for (const g of groupsIn) {
+      const codes = Array.isArray(g.barcodes)
+        ? [...new Set(g.barcodes.map(c => String(c || "").trim()).filter(Boolean))] : [];
+      if (!codes.length) throw new HttpError(400, "empty_group", "إحدى المجموعات لا تحتوي على أي باركود صالح");
+      const wholesalePrice = toMoney(g.wholesalePrice ?? 0, { field: "wholesalePrice" });
+      const salePrice = toMoney(g.salePrice ?? 0, { field: "salePrice" });
+      for (const c of codes) {
+        if (allCodes.includes(c)) throw new HttpError(409, "duplicate_in_batch", "الباركود " + c + " مكرر داخل نفس الدفعة");
+        allCodes.push(c);
+      }
+      groups.push({ codes, wholesalePrice, salePrice });
+    }
+
+    const dup = await client.query(
+      `SELECT barcode FROM product_barcodes WHERE barcode = ANY($1::text[])
+       UNION SELECT barcode FROM products WHERE barcode = ANY($1::text[])
+       LIMIT 1`, [allCodes]);
+    if (dup.rows.length) {
+      throw new HttpError(409, "barcode_taken", "الباركود \"" + dup.rows[0].barcode + "\" مسجل مسبقًا لمنتج آخر");
+    }
+
+    const found = await client.query(
+      `SELECT * FROM products WHERE lower(btrim(name)) = lower(btrim($1)) LIMIT 1`, [name]);
+    let prod;
+    if (found.rows.length) {
+      prod = found.rows[0];
+      if (prod.kind !== "accessory") {
+        throw new HttpError(409, "kind_locked", "هذا الاسم يخص منتجًا من نوع هاتف (IMEI) — استخدم اسمًا آخر");
+      }
+    } else {
+      const categoryId = req.body.categoryId ? toInt(req.body.categoryId, { field: "categoryId", min: 1 }) : null;
+      const ins = await client.query(
+        `INSERT INTO products (name, category_id, kind, barcode, purchase_price, sale_price, min_stock)
+         VALUES ($1,$2,'accessory',NULL,$3,$4,3) RETURNING *`,
+        [name, categoryId, groups[0].wholesalePrice, groups[0].salePrice]);
+      prod = ins.rows[0];
+    }
+
+    for (const g of groups) {
+      for (const code of g.codes) {
+        await client.query(
+          `INSERT INTO product_barcodes (product_id, barcode, wholesale_price, sale_price) VALUES ($1,$2,$3,$4)`,
+          [prod.id, code, g.wholesalePrice, g.salePrice]);
+      }
+    }
+
+    if (qty > 0) {
+      await client.query("UPDATE products SET quantity = quantity + $1, updated_at = now() WHERE id = $2", [qty, prod.id]);
+      const day = await ledger.getOpenDay(client);
+      await ledger.recordStockMove(client, {
+        productId: prod.id, qtyIn: qty, reason: "initial",
+        note: "دفعة باركود جديدة (" + allCodes.length + " باركود)", dayId: day ? day.id : null
+      });
+    }
+    return getProduct(client, prod.id, false);
+  });
+  res.status(201).json({ product: mapProduct(product) });
+}));
+
+/* ───────────── حذف منتج — فقط إذا لم يسبق تحركه (وإلا: أرشفة) ───────────── */
+router.delete("/products/:id(\\d+)", wrap(async (req, res) => {
   await db.tx(async client => {
-    await client.query(`TRUNCATE sale_returns, invoice_items, invoices, purchase_items, purchases,
-                        expenses, cash_movements, stocktake_items, stocktakes, stock_movements,
-                        phone_units, products, categories, day_summaries, notes, days, product_names
-                        RESTART IDENTITY CASCADE`);
-    await client.query("SELECT setval('invoice_seq', 1, false)");
-    await client.query("SELECT setval('purchase_seq', 1, false)");
-    /* التصنيفات الافتراضية تُعاد دائماً */
-    await client.query(`INSERT INTO categories (name, sort_order) VALUES
-      ('هواتف', 1), ('إكسسوارات', 2), ('سماعات', 3), ('شواحن', 4),
-      ('حمايات', 5), ('بطاريات', 6), ('ذاكرة وتخزين', 7), ('أخرى', 8)
-      ON CONFLICT (name) DO NOTHING`);
+    const prod = await getProduct(client, req.params.id, true);
+    const used = await client.query(
+      `SELECT (SELECT count(*) FROM stock_movements WHERE product_id = $1) AS moves,
+              (SELECT count(*) FROM invoice_items WHERE product_id = $1) AS sales,
+              (SELECT count(*) FROM purchase_items WHERE product_id = $1) AS purchases`, [prod.id]);
+    const u = used.rows[0];
+    if (Number(u.moves) > 0 || Number(u.sales) > 0 || Number(u.purchases) > 0) {
+      throw new HttpError(409, "product_in_use",
+        "لا يمكن حذف منتج له سجل حركة أو عمليات — أرشفه بدلاً من ذلك لتبقى التقارير سليمة");
+    }
+    await client.query("DELETE FROM phone_units WHERE product_id = $1", [prod.id]);
+    await client.query("DELETE FROM products WHERE id = $1", [prod.id]);
   });
-  res.json({ ok: true });
+  res.json({ ok: true, id: String(req.params.id) });
+}));
+
+/* ───────────── تسوية يدوية للكمية ───────────── */
+router.post("/products/:id(\\d+)/adjust", wrap(async (req, res) => {
+  const out = await db.tx(async client => {
+    const prod = await getProduct(client, req.params.id, true);
+    const day = await ledger.requireOpenDay(client);
+    const direction = req.body.direction === "out" ? "out" : "in";
+    const qty = toInt(req.body.qty, { field: "qty" });
+    const note = req.body.note ? cleanText(req.body.note, { field: "note", max: 200, required: false }) : "تسوية يدوية";
+
+    if (direction === "in") {
+      if (prod.kind === "phone") {
+        await createUnits(client, prod.id, Array(qty).fill(""), null, day.id, "adjustment");
+      } else {
+        await client.query("UPDATE products SET quantity = quantity + $1, updated_at = now() WHERE id = $2", [qty, prod.id]);
+        await ledger.recordStockMove(client, { productId: prod.id, qtyIn: qty, reason: "adjustment", note, dayId: day.id });
+      }
+    } else {
+      if (prod.quantity < qty) throw new HttpError(400, "stock_insufficient", "الكمية المتوفرة " + prod.quantity);
+      if (prod.kind === "phone") {
+        /* حذف أقدم الوحدات (بدون IMEI أولاً) */
+        const units = await client.query(
+          `SELECT id FROM phone_units WHERE product_id = $1 AND status = 'in_stock'
+            ORDER BY (imei IS NULL) DESC, created_at, id LIMIT $2 FOR UPDATE`, [prod.id, qty]);
+        if (units.rows.length < qty) throw new HttpError(400, "stock_insufficient", "الوحدات المتوفرة " + units.rows.length);
+        for (const u of units.rows) await client.query("DELETE FROM phone_units WHERE id = $1", [u.id]);
+        await client.query("UPDATE products SET quantity = quantity - $1, updated_at = now() WHERE id = $2", [qty, prod.id]);
+        await ledger.recordStockMove(client, { productId: prod.id, qtyOut: qty, reason: "adjustment", note, dayId: day.id });
+      } else {
+        await client.query("UPDATE products SET quantity = quantity - $1, updated_at = now() WHERE id = $2", [qty, prod.id]);
+        await ledger.recordStockMove(client, { productId: prod.id, qtyOut: qty, reason: "adjustment", note, dayId: day.id });
+      }
+    }
+    return getProduct(client, prod.id, false);
+  });
+  res.json({ product: mapProduct(out) });
+}));
+
+/* ───────────── وحدات الهاتف ───────────── */
+router.get("/products/:id(\\d+)/units", wrap(async (req, res) => {
+  const prod = await db.query("SELECT id FROM products WHERE id = $1", [req.params.id]);
+  if (!prod.rows.length) throw new HttpError(404, "product_not_found", "Product not found");
+  const { rows } = await db.query(
+    `SELECT u.*, iv.invoice_no
+       FROM phone_units u
+       LEFT JOIN invoice_items ii ON ii.id = u.invoice_item_id
+       LEFT JOIN invoices iv ON iv.id = ii.invoice_id
+      WHERE u.product_id = $1
+      ORDER BY (u.status = 'in_stock') DESC, u.created_at DESC, u.id DESC`, [req.params.id]);
+  res.json({ units: rows.map(r => Object.assign(mapUnit(r), { invoiceNo: r.invoice_no || null })) });
+}));
+
+router.post("/products/:id(\\d+)/units", wrap(async (req, res) => {
+  const unit = await db.tx(async client => {
+    const prod = await getProduct(client, req.params.id, true);
+    if (prod.kind !== "phone") throw new HttpError(400, "not_a_phone", "إضافة الوحدات متاحة لمنتجات الهواتف فقط");
+    const day = await ledger.requireOpenDay(client);
+    const imei = String(req.body.imei || "").replace(/\s+/g, "").slice(0, 20) || null;
+    const serial = req.body.serial ? cleanText(req.body.serial, { field: "serial", max: 40, required: false }) : null;
+    if (imei) await checkImeisFree(client, [imei], null);
+    const { rows } = await client.query(
+      "INSERT INTO phone_units (product_id, imei, serial) VALUES ($1,$2,$3) RETURNING *",
+      [prod.id, imei, serial]);
+    await client.query("UPDATE products SET quantity = quantity + 1, updated_at = now() WHERE id = $1", [prod.id]);
+    await ledger.recordStockMove(client, {
+      productId: prod.id, qtyIn: 1, reason: "initial",
+      note: "إضافة وحدة " + (imei || serial || ""), dayId: day.id
+    });
+    return rows[0];
+  });
+  res.status(201).json({ unit: mapUnit(unit) });
+}));
+
+router.put("/units/:id(\\d+)", wrap(async (req, res) => {
+  const unit = await db.tx(async client => {
+    const { rows } = await client.query("SELECT * FROM phone_units WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (!rows.length) throw new HttpError(404, "unit_not_found", "الوحدة غير موجودة");
+    const u = rows[0];
+    const imei = req.body.imei !== undefined
+      ? (String(req.body.imei || "").replace(/\s+/g, "").slice(0, 20) || null) : u.imei;
+    const serial = req.body.serial !== undefined
+      ? (req.body.serial ? cleanText(req.body.serial, { field: "serial", max: 40, required: false }) : null) : u.serial;
+    if (imei) await checkImeisFree(client, [imei], u.id);
+    const out = await client.query(
+      "UPDATE phone_units SET imei = $1, serial = $2, updated_at = now() WHERE id = $3 RETURNING *",
+      [imei, serial, u.id]);
+    /* تحديث لقطة IMEI في بنود الفواتير السابقة غير مطلوب — اللقطة تاريخية */
+    return out.rows[0];
+  });
+  res.json({ unit: mapUnit(unit) });
+}));
+
+router.delete("/units/:id(\\d+)", wrap(async (req, res) => {
+  await db.tx(async client => {
+    const { rows } = await client.query("SELECT * FROM phone_units WHERE id = $1 FOR UPDATE", [req.params.id]);
+    if (!rows.length) throw new HttpError(404, "unit_not_found", "الوحدة غير موجودة");
+    if (rows[0].status !== "in_stock") throw new HttpError(409, "unit_not_in_stock", "لا يمكن حذف وحدة مبيعة");
+    const day = await ledger.getOpenDay(client);
+    await client.query("DELETE FROM phone_units WHERE id = $1", [req.params.id]);
+    await client.query("UPDATE products SET quantity = quantity - 1, updated_at = now() WHERE id = $1", [rows[0].product_id]);
+    await ledger.recordStockMove(client, {
+      productId: rows[0].product_id, qtyOut: 1, reason: "adjustment",
+      note: "حذف وحدة " + (rows[0].imei || ""), dayId: day ? day.id : null
+    });
+  });
+  res.json({ ok: true, id: String(req.params.id) });
+}));
+
+/* ───────────── حركة المخزون ───────────── */
+router.get("/movements", wrap(async (req, res) => {
+  const where = [], params = [];
+  if (req.query.productId) { params.push(req.query.productId); where.push(`m.product_id = $${params.length}`); }
+  if (req.query.reason)    { params.push(req.query.reason);    where.push(`m.reason = $${params.length}`); }
+  if (req.query.from)      { params.push(req.query.from);      where.push(`m.moved_at >= $${params.length}::date`); }
+  if (req.query.to)        { params.push(req.query.to);        where.push(`m.moved_at < ($${params.length}::date + 1)`); }
+  const limit = Math.min(parseInt(req.query.limit || "500", 10) || 500, 2000);
+  params.push(limit);
+  const { rows } = await db.query(
+    `SELECT m.*, p.name AS product_name FROM stock_movements m
+      JOIN products p ON p.id = m.product_id
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY m.moved_at DESC, m.id DESC LIMIT $${params.length}`, params);
+  res.json({ movements: rows.map(mapStockMove) });
+}));
+
+/* ───────────── التصنيفات ───────────── */
+router.post("/categories", wrap(async (req, res) => {
+  const name = cleanText(req.body.name, { field: "name", max: 40 });
+  const { rows } = await db.query(
+    `INSERT INTO categories (name, sort_order) VALUES ($1, 99)
+     ON CONFLICT (name) DO UPDATE SET sort_order = categories.sort_order RETURNING *`, [name]);
+  res.status(201).json({ category: mapCategory(rows[0]) });
+}));
+router.put("/categories/:id(\\d+)", wrap(async (req, res) => {
+  const name = cleanText(req.body.name, { field: "name", max: 40 });
+  const { rows } = await db.query(
+    `INSERT INTO categories (id, name) VALUES ($1,$2)
+     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name RETURNING *`, [req.params.id, name]);
+  res.json({ category: mapCategory(rows[0]) });
+}));
+router.delete("/categories/:id(\\d+)", wrap(async (req, res) => {
+  await db.query("UPDATE products SET category_id = NULL WHERE category_id = $1", [req.params.id]);
+  await db.query("DELETE FROM categories WHERE id = $1", [req.params.id]);
+  res.json({ ok: true, id: String(req.params.id) });
+}));
+
+/* ───────────── الجرد ───────────── */
+router.get("/stocktakes", wrap(async (_req, res) => {
+  const { rows } = await db.query("SELECT * FROM stocktakes ORDER BY created_at DESC, id DESC LIMIT 100");
+  res.json({ stocktakes: rows.map(mapStocktake) });
+}));
+
+router.post("/stocktakes", wrap(async (req, res) => {
+  const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
+  if (!lines.length) throw new HttpError(400, "lines_required", "أضف أصناف الجرد");
+  const out = await db.tx(async client => {
+    const day = await ledger.requireOpenDay(client);
+    const note = req.body.note ? cleanText(req.body.note, { field: "note", max: 200, required: false }) : null;
+    const st = (await client.query(
+      "INSERT INTO stocktakes (day_id, note) VALUES ($1,$2) RETURNING *", [day.id, note])).rows[0];
+
+    let diffLines = 0;
+    for (const ln of lines) {
+      const prod = await getProduct(client, ln.productId, true);
+      const counted = toInt(ln.countedQty, { field: "countedQty", min: 0, max: 100000 });
+      const diff = counted - prod.quantity;
+      await client.query(
+        `INSERT INTO stocktake_items (stocktake_id, product_id, product_name, system_qty, counted_qty)
+         VALUES ($1,$2,$3,$4,$5)`, [st.id, prod.id, prod.name, prod.quantity, counted]);
+
+      if (diff > 0) {
+        if (prod.kind === "phone") {
+          await createUnits(client, prod.id, Array(diff).fill(""), null, day.id, "adjustment");
+        } else {
+          await client.query("UPDATE products SET quantity = $1, updated_at = now() WHERE id = $2", [counted, prod.id]);
+          await ledger.recordStockMove(client, {
+            productId: prod.id, qtyIn: diff, reason: "adjustment",
+            refType: "stocktake", refId: st.id, note: "جرد: زيادة " + diff, dayId: day.id });
+        }
+      } else if (diff < 0) {
+        if (prod.kind === "phone") {
+          const units = await client.query(
+            `SELECT id FROM phone_units WHERE product_id = $1 AND status = 'in_stock'
+              ORDER BY (imei IS NULL) DESC, created_at, id LIMIT $2 FOR UPDATE`, [prod.id, -diff]);
+          if (units.rows.length < -diff) throw new HttpError(400, "stock_insufficient", "الوحدات المتوفرة أقل من الفرق");
+          for (const u of units.rows) await client.query("DELETE FROM phone_units WHERE id = $1", [u.id]);
+        }
+        await client.query("UPDATE products SET quantity = $1, updated_at = now() WHERE id = $2", [counted, prod.id]);
+        await ledger.recordStockMove(client, {
+          productId: prod.id, qtyOut: -diff, reason: "adjustment",
+          refType: "stocktake", refId: st.id, note: "جرد: نقص " + (-diff), dayId: day.id });
+      }
+      if (diff !== 0) diffLines++;
+    }
+    await client.query("UPDATE stocktakes SET lines = $1, diff_lines = $2 WHERE id = $3",
+      [lines.length, diffLines, st.id]);
+    return (await client.query("SELECT * FROM stocktakes WHERE id = $1", [st.id])).rows[0];
+  });
+  res.status(201).json({ stocktake: mapStocktake(out) });
+}));
+
+router.get("/stocktakes/:id(\\d+)", wrap(async (req, res) => {
+  const st = await db.query("SELECT * FROM stocktakes WHERE id = $1", [req.params.id]);
+  if (!st.rows.length) throw new HttpError(404, "stocktake_not_found", "الجرد غير موجود");
+  const items = await db.query(
+    "SELECT * FROM stocktake_items WHERE stocktake_id = $1 ORDER BY diff = 0, product_name", [req.params.id]);
+  res.json({ stocktake: mapStocktake(st.rows[0]), items: items.rows.map(r => ({
+    id: String(r.id), productId: String(r.product_id), product: r.product_name,
+    systemQty: r.system_qty, countedQty: r.counted_qty, diff: r.diff
+  })) });
 }));
 
 module.exports = router;
