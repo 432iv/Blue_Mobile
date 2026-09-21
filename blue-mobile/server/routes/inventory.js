@@ -30,9 +30,29 @@ async function assertBarcodeFree(client, barcode, exceptId) {
   const code = String(barcode || "").trim();
   if (!code) return null;
   const { rows } = await client.query(
-    "SELECT id FROM products WHERE barcode = $1 AND id <> COALESCE($2::bigint, 0)", [code, exceptId || null]);
+    `SELECT id FROM products WHERE barcode = $1 AND id <> COALESCE($2::bigint, 0)
+     UNION ALL
+     SELECT product_id FROM product_barcodes WHERE barcode = $1 AND product_id <> COALESCE($2::bigint, 0)`,
+    [code, exceptId || null]);
   if (rows.length) throw new HttpError(409, "barcode_taken", "هذا الباركود مستخدم لمنتج آخر");
   return code || null;
+}
+
+/* مزامنة عمود products.barcode (النموذج البسيط) مع جدول product_barcodes (مصدر الحقيقة
+   لكل عمليات البحث ومنع التكرار)، حتى تبقى الطريقتان متوافقتين تمامًا دون تكرار أو تضارب. */
+async function syncDefaultBarcode(client, productId, oldBarcode, newBarcode, wholesalePrice, salePrice) {
+  const oldCode = oldBarcode ? String(oldBarcode).trim() : "";
+  const newCode = newBarcode ? String(newBarcode).trim() : "";
+  if (oldCode && oldCode !== newCode) {
+    await client.query("DELETE FROM product_barcodes WHERE product_id = $1 AND barcode = $2", [productId, oldCode]);
+  }
+  if (newCode) {
+    await client.query(
+      `INSERT INTO product_barcodes (product_id, barcode, wholesale_price, sale_price)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (barcode) DO UPDATE SET wholesale_price = $3, sale_price = $4`,
+      [productId, newCode, wholesalePrice, salePrice]);
+  }
 }
 
 /* تنظيف قائمة IMEI: إزالة الفراغات والتكرار */
@@ -133,6 +153,7 @@ router.post("/products", wrap(async (req, res) => {
        req.body.storage ? cleanText(req.body.storage, { field: "storage", max: 40, required: false }) : null,
        purchasePrice, salePrice, minStock]);
     const prod = rows[0];
+    await syncDefaultBarcode(client, prod.id, null, barcode, purchasePrice, salePrice);
 
     const day = await ledger.getOpenDay(client);
     if (kind === "phone") {
@@ -180,6 +201,8 @@ router.put("/products/:id(\\d+)", wrap(async (req, res) => {
       kind = req.body.kind === "phone" ? "phone" : "accessory";
     }
 
+    const newPurchasePrice = toMoney(req.body.purchasePrice ?? prod.purchase_price, { field: "purchasePrice" });
+    const newSalePrice = toMoney(req.body.salePrice ?? prod.sale_price, { field: "salePrice" });
     await client.query(
       `UPDATE products SET name=$1, category_id=$2, kind=$3, barcode=$4,
               image_url=$5, model=$6, color=$7, storage=$8,
@@ -190,14 +213,102 @@ router.put("/products/:id(\\d+)", wrap(async (req, res) => {
        req.body.model !== undefined ? (req.body.model ? cleanText(req.body.model, { field: "model", max: 60, required: false }) : null) : prod.model,
        req.body.color !== undefined ? (req.body.color ? cleanText(req.body.color, { field: "color", max: 40, required: false }) : null) : prod.color,
        req.body.storage !== undefined ? (req.body.storage ? cleanText(req.body.storage, { field: "storage", max: 40, required: false }) : null) : prod.storage,
-       toMoney(req.body.purchasePrice ?? prod.purchase_price, { field: "purchasePrice" }),
-       toMoney(req.body.salePrice ?? prod.sale_price, { field: "salePrice" }),
+       newPurchasePrice, newSalePrice,
        toInt(req.body.minStock ?? prod.min_stock, { field: "minStock", min: 0, max: 100000 }),
        req.body.active === undefined ? prod.is_active : !!req.body.active,
        prod.id]);
+    await syncDefaultBarcode(client, prod.id, prod.barcode, barcode, newPurchasePrice, newSalePrice);
     return getProduct(client, prod.id, false);
   });
   res.json({ product: mapProduct(product) });
+}));
+
+/* ───────────── خريطة كل الباركودات (للبحث الفوري من المتصفح دون اتصال بالخادم) ───────────── */
+router.get("/barcodes", wrap(async (_req, res) => {
+  const { rows } = await db.query(
+    `SELECT pb.barcode, pb.product_id AS "productId",
+            pb.wholesale_price AS "wholesalePrice", pb.sale_price AS "salePrice",
+            p.name AS "productName", p.kind, p.quantity AS qty, p.is_active AS active
+       FROM product_barcodes pb JOIN products p ON p.id = pb.product_id
+      ORDER BY pb.id`);
+  res.json({
+    barcodes: rows.map(r => ({
+      barcode: r.barcode, productId: String(r.productId), productName: r.productName,
+      kind: r.kind, qty: Number(r.qty), active: r.active,
+      wholesalePrice: Number(r.wholesalePrice), salePrice: Number(r.salePrice)
+    }))
+  });
+}));
+
+/* ───────────── حفظ دفعة تسجيل منتجات جديدة بالباركود (وضع تسجيل المنتجات) ─────────────
+   منتج رئيسي واحد (جديد أو موجود بنفس الاسم بالضبط) + عدة مجموعات باركود، كل مجموعة
+   لها سعر جملة/بيع خاص بها، والكمية الإجمالية تُضاف على مستوى المنتج فقط. */
+router.post("/barcode-batches", wrap(async (req, res) => {
+  const product = await db.tx(async client => {
+    const name = cleanText(req.body.productName, { field: "productName", max: 120 });
+    const qty = toInt(req.body.qty ?? 0, { field: "qty", min: 0, max: 1000000 });
+    const groupsIn = Array.isArray(req.body.groups) ? req.body.groups : [];
+    if (!groupsIn.length) throw new HttpError(400, "no_barcodes", "لا توجد باركودات في هذه الدفعة");
+
+    const groups = [];
+    const allCodes = [];
+    for (const g of groupsIn) {
+      const codes = Array.isArray(g.barcodes)
+        ? [...new Set(g.barcodes.map(c => String(c || "").trim()).filter(Boolean))] : [];
+      if (!codes.length) throw new HttpError(400, "empty_group", "إحدى المجموعات لا تحتوي على أي باركود صالح");
+      const wholesalePrice = toMoney(g.wholesalePrice ?? 0, { field: "wholesalePrice" });
+      const salePrice = toMoney(g.salePrice ?? 0, { field: "salePrice" });
+      for (const c of codes) {
+        if (allCodes.includes(c)) throw new HttpError(409, "duplicate_in_batch", "الباركود " + c + " مكرر داخل نفس الدفعة");
+        allCodes.push(c);
+      }
+      groups.push({ codes, wholesalePrice, salePrice });
+    }
+
+    const dup = await client.query(
+      `SELECT barcode FROM product_barcodes WHERE barcode = ANY($1::text[])
+       UNION SELECT barcode FROM products WHERE barcode = ANY($1::text[])
+       LIMIT 1`, [allCodes]);
+    if (dup.rows.length) {
+      throw new HttpError(409, "barcode_taken", "الباركود \"" + dup.rows[0].barcode + "\" مسجل مسبقًا لمنتج آخر");
+    }
+
+    const found = await client.query(
+      `SELECT * FROM products WHERE lower(btrim(name)) = lower(btrim($1)) LIMIT 1`, [name]);
+    let prod;
+    if (found.rows.length) {
+      prod = found.rows[0];
+      if (prod.kind !== "accessory") {
+        throw new HttpError(409, "kind_locked", "هذا الاسم يخص منتجًا من نوع هاتف (IMEI) — استخدم اسمًا آخر");
+      }
+    } else {
+      const categoryId = req.body.categoryId ? toInt(req.body.categoryId, { field: "categoryId", min: 1 }) : null;
+      const ins = await client.query(
+        `INSERT INTO products (name, category_id, kind, barcode, purchase_price, sale_price, min_stock)
+         VALUES ($1,$2,'accessory',NULL,$3,$4,3) RETURNING *`,
+        [name, categoryId, groups[0].wholesalePrice, groups[0].salePrice]);
+      prod = ins.rows[0];
+    }
+
+    for (const g of groups) {
+      for (const code of g.codes) {
+        await client.query(
+          `INSERT INTO product_barcodes (product_id, barcode, wholesale_price, sale_price) VALUES ($1,$2,$3,$4)`,
+          [prod.id, code, g.wholesalePrice, g.salePrice]);
+      }
+    }
+
+    if (qty > 0) {
+      await client.query("UPDATE products SET quantity = quantity + $1, updated_at = now() WHERE id = $2", [qty, prod.id]);
+      const day = await ledger.getOpenDay(client);
+      await ledger.recordStockMove(client, {
+        productId: prod.id, qtyIn: qty, reason: "initial",
+        note: "دفعة باركود جديدة (" + allCodes.length + " باركود)", dayId: day ? day.id : null
+      });
+    }
+    return getProduct(client, prod.id, false);
+  });
+  res.status(201).json({ product: mapProduct(product) });
 }));
 
 /* ───────────── حذف منتج — فقط إذا لم يسبق تحركه (وإلا: أرشفة) ───────────── */
