@@ -1,4 +1,4 @@
-use strict";
+"use strict";
 /* ═══════════════════════════════════════════════════════════════════
    /api/settings · /api/bootstrap · /api/payment-methods
    /api/backup (نسخ احتياطي) · /api/backup/restore (استرجاع)
