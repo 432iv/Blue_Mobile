@@ -536,7 +536,8 @@ html[data-theme="light"] .toast{box-shadow:0 24px 54px -18px rgba(23,55,135,.35)
 
 /* ═════════════════ Modals ═════════════════ */
 .modal-overlay{
-  position:fixed;inset:0;z-index:100;display:grid;place-items:center;padding:22px;
+  position:fixed;inset:0;z-index:100;display:flex;flex-direction:column;align-items:center;
+  overflow-y:auto;padding:22px;
   background:rgba(2,6,18,.6);
   backdrop-filter:blur(12px) saturate(120%);-webkit-backdrop-filter:blur(12px) saturate(120%);
   opacity:0;pointer-events:none;visibility:hidden;
@@ -552,6 +553,7 @@ html[data-theme="light"] .modal-overlay{background:rgba(120,140,180,.35)}
   backdrop-filter:blur(36px) saturate(160%);-webkit-backdrop-filter:blur(36px) saturate(160%);
   transform:translateY(16px) scale(.96);
   transition:transform .34s var(--ease);
+  margin:auto 0;flex-shrink:0;
 }
 .modal-overlay.show .modal{transform:none}
 .modal.danger-modal{border-color:var(--modal-brd);box-shadow:0 40px 90px -20px rgba(1,5,20,.85), 0 0 40px -10px rgba(239,68,68,.3), inset 0 1px 0 rgba(255,255,255,.1)}
@@ -3522,6 +3524,13 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
   display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .bc-group-card .codes{font-family:monospace;direction:ltr;font-size:12.5px;opacity:.85}
 .bc-group-card .prices{font-weight:700;white-space:nowrap}
+.bc-items-wrap{max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+.bc-item-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  background:rgba(127,127,127,.06);border-radius:10px;padding:8px 10px}
+.bc-item-row .code{font-family:monospace;direction:ltr;font-size:13px;min-width:120px;flex:1 1 120px}
+.bc-item-row .glass-field{min-width:100px;flex:1 1 100px}
+.bc-item-row .x{cursor:pointer;opacity:.6;font-weight:700;padding:0 4px;flex:0 0 auto}
+.bc-item-row .x:hover{opacity:1;color:#ef4444}
 .t-id{display:inline-flex;align-items:center;gap:10px}
 .stats-grid>.card:nth-child(1){animation-delay:.18s}
 .stats-grid>.card:nth-child(2){animation-delay:.24s}
@@ -3636,38 +3645,35 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
 </div>
 
 <div class="modal-overlay" id="bcRegModal" role="dialog" aria-modal="true" aria-labelledby="bcRegTitle">
-  <div class="modal" style="max-width:720px">
+  <div class="modal" style="max-width:760px">
     <div class="modal-icon"><svg><use href="#i-barcode"/></svg></div>
     <h3 id="bcRegTitle">دفعة تسجيل منتجات جديدة</h3>
-    <p class="modal-sub">اربط الباركودات الممسوحة بمنتج واحد، وحدد سعر لكل مجموعة إن اختلفت الأسعار</p>
+    <p class="modal-sub">حدد سعر الجملة والبيع لكل باركود على حدة، أو عبّئ سعرًا واحدًا للكل بضغطة زر</p>
 
     <div class="bc-reg-section">
-      <div class="bc-reg-lbl">باركودات بلا مجموعة سعر <span id="bcUngroupedCount">(0)</span></div>
-      <div class="bc-chip-wrap" id="bcUngroupedWrap"><span class="f-hint">لا يوجد — امسح باركودات المنتج بقارئك الآن</span></div>
-    </div>
-
-    <div class="bc-reg-section" id="bcGroupFormWrap">
-      <div class="bc-reg-lbl">تحديد سعر لمجموعة من الباركودات المختارة أعلاه</div>
+      <div class="bc-reg-lbl">تعبئة سريعة (اختياري) — يطبَّق على كل الباركودات دفعة واحدة</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
-        <div style="flex:1;min-width:140px">
+        <div style="flex:1;min-width:130px">
           <span class="field-label">سعر الجملة</span>
-          <div class="glass-field"><input type="number" id="bcGroupWholesale" inputmode="decimal" step="0.01" min="0" placeholder="0.00"></div>
+          <div class="glass-field"><input type="number" id="bcBulkWholesale" inputmode="decimal" step="0.01" min="0" placeholder="0.00"></div>
         </div>
-        <div style="flex:1;min-width:140px">
+        <div style="flex:1;min-width:130px">
           <span class="field-label">سعر البيع</span>
-          <div class="glass-field"><input type="number" id="bcGroupSale" inputmode="decimal" step="0.01" min="0" placeholder="0.00"></div>
+          <div class="glass-field"><input type="number" id="bcBulkSale" inputmode="decimal" step="0.01" min="0" placeholder="0.00"></div>
         </div>
-        <button type="button" class="btn btn-primary" id="bcGroupSaveBtn">حفظ المجموعة</button>
+        <button type="button" class="btn btn-ghost" id="bcBulkApplyBtn">تطبيق على كل الباركودات</button>
       </div>
     </div>
 
-    <div class="bc-reg-section" id="bcGroupsListWrap" hidden>
-      <div class="bc-reg-lbl">المجموعات المحفوظة لهذه الدفعة</div>
-      <div id="bcGroupsList"></div>
+    <div class="bc-reg-section">
+      <div class="bc-reg-lbl">الباركودات الممسوحة <span id="bcItemsCount">(0)</span></div>
+      <div id="bcItemsWrap" class="bc-items-wrap">
+        <span class="f-hint">لا يوجد — امسح باركودات المنتج بقارئك الآن</span>
+      </div>
     </div>
 
     <div class="bc-reg-section">
-      <span class="field-label">اسم المنتج (اسم موجود = إضافة الكمية والمجموعات إليه، اسم جديد = منتج جديد)</span>
+      <span class="field-label">اسم المنتج (اسم موجود = إضافة الكمية والباركودات إليه، اسم جديد = منتج جديد)</span>
       <div class="glass-field">
         <input type="text" id="bcRegProductName" list="bcProdNames" placeholder="مثال: شاحن موكسوم" maxlength="120">
       </div>
@@ -7589,12 +7595,11 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
 
   /* ═══════════════════════════════════════════════════════════════════
      وضع تسجيل المنتجات الجديدة بالباركود (منفصل تمامًا عن وضع البيع)
-     يجمع باركودات متتابعة في "دفعة" مؤقتة بالمتصفح، ثم يربطها دفعة واحدة
-     باسم منتج رئيسي واحد ومجموعات أسعار (كل مجموعة سعر جملة/بيع خاص بها)،
-     والكمية الإجمالية تبقى على مستوى المنتج فقط.
+     يجمع باركودات متتابعة في "دفعة" مؤقتة بالمتصفح، ولكل باركود سعر جملة/بيع
+     مستقل قابل للتعديل فرديًا (مع إمكانية تعبئة سعر واحد للكل بضغطة زر توفيرًا للوقت)،
+     ثم تُربط كلها باسم منتج رئيسي واحد وكمية إجمالية واحدة تُضاف لرصيده.
      ═══════════════════════════════════════════════════════════════════ */
-  var regBatch = { codes: [], groups: [] };
-  var bcSelectedUngrouped = new Set();
+  var regBatch = { items: [] };   /* item = { code, wholesale, sale } */
   var bcRegBar = $('#bcRegBar');
   var bcRegModal = $('#bcRegModal');
 
@@ -7602,15 +7607,13 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
     return !!(App.state.settings && App.state.settings.barcode_register_mode);
   }
   function allBatchCodes(){
-    var all = regBatch.codes.slice();
-    regBatch.groups.forEach(function(g){ all = all.concat(g.codes); });
-    return all;
+    return regBatch.items.map(function(it){ return it.code; });
   }
   function isCodeKnown(code){
     return App.barcodeMap.has(code) || allBatchCodes().indexOf(code) !== -1;
   }
   function updateRegBar(){
-    $('#bcRegCount').textContent = allBatchCodes().length;
+    $('#bcRegCount').textContent = regBatch.items.length;
     bcRegBar.hidden = !registerModeEnabled();
   }
   function handleBarcodeRegister(code){
@@ -7618,81 +7621,55 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
       showToast('الباركود ' + code + ' مسجَّل مسبقًا — تم تجاهله لمنع التكرار', 'danger');
       return;
     }
-    regBatch.codes.push(code);
+    /* يرث سعر آخر باركود مُضاف تلقائيًا (توفيرًا للوقت عند تكرار نفس السعر)، وقابل للتعديل فوريًا */
+    var last = regBatch.items[regBatch.items.length - 1];
+    regBatch.items.push({ code: code, wholesale: last ? last.wholesale : 0, sale: last ? last.sale : 0 });
     updateRegBar();
     if(bcRegModal.classList.contains('show')) renderRegModal();
     showToast('أُضيف الباركود: ' + code, 'success');
   }
 
   function renderRegModal(){
-    var wrap = $('#bcUngroupedWrap');
-    $('#bcUngroupedCount').textContent = '(' + regBatch.codes.length + ')';
-    if(!regBatch.codes.length){
+    var wrap = $('#bcItemsWrap');
+    $('#bcItemsCount').textContent = '(' + regBatch.items.length + ')';
+    if(!regBatch.items.length){
       wrap.innerHTML = '<span class="f-hint">لا يوجد — امسح باركودات المنتج بقارئك الآن</span>';
     }else{
-      wrap.innerHTML = regBatch.codes.map(function(c){
-        var sel = bcSelectedUngrouped.has(c) ? ' sel' : '';
-        return '<span class="bc-chip' + sel + '" data-code="' + esc(c) + '">' + esc(c) +
-               ' <span class="x" data-remove="' + esc(c) + '">✕</span></span>';
-      }).join('');
-      wrap.querySelectorAll('.bc-chip').forEach(function(chip){
-        chip.addEventListener('click', function(e){
-          if(e.target.hasAttribute('data-remove')){
-            var rc = e.target.getAttribute('data-remove');
-            regBatch.codes = regBatch.codes.filter(function(x){ return x !== rc; });
-            bcSelectedUngrouped.delete(rc);
-            updateRegBar(); renderRegModal();
-            return;
-          }
-          var code = chip.getAttribute('data-code');
-          if(bcSelectedUngrouped.has(code)) bcSelectedUngrouped.delete(code);
-          else bcSelectedUngrouped.add(code);
-          renderRegModal();
-        });
-      });
-    }
-
-    var glWrap = $('#bcGroupsListWrap'), gl = $('#bcGroupsList');
-    if(!regBatch.groups.length){ glWrap.hidden = true; }
-    else{
-      glWrap.hidden = false;
-      gl.innerHTML = regBatch.groups.map(function(g, i){
-        return '<div class="bc-group-card">' +
-          '<span class="codes">' + g.codes.map(esc).join(' · ') + '</span>' +
-          '<span class="prices">جملة ' + money(g.wholesalePrice) + ' / بيع ' + money(g.salePrice) + ' ' + CUR() + '</span>' +
-          '<button type="button" class="btn btn-ghost btn-sm" data-ungroup="' + i + '">فك المجموعة</button>' +
+      wrap.innerHTML = regBatch.items.map(function(it, i){
+        return '<div class="bc-item-row" data-i="' + i + '">' +
+          '<span class="code">' + esc(it.code) + '</span>' +
+          '<div class="glass-field"><input type="number" class="bc-w" inputmode="decimal" step="0.01" min="0" placeholder="سعر الجملة" value="' + (it.wholesale || '') + '"></div>' +
+          '<div class="glass-field"><input type="number" class="bc-s" inputmode="decimal" step="0.01" min="0" placeholder="سعر البيع" value="' + (it.sale || '') + '"></div>' +
+          '<span class="x" data-remove="' + i + '" title="حذف">✕</span>' +
         '</div>';
       }).join('');
-      gl.querySelectorAll('[data-ungroup]').forEach(function(btn){
-        btn.addEventListener('click', function(){
-          var i = +btn.getAttribute('data-ungroup');
-          var g = regBatch.groups.splice(i, 1)[0];
-          regBatch.codes = regBatch.codes.concat(g.codes);
-          renderRegModal();
+      wrap.querySelectorAll('.bc-item-row').forEach(function(rowEl){
+        var i = +rowEl.getAttribute('data-i');
+        rowEl.querySelector('.bc-w').addEventListener('input', function(){ regBatch.items[i].wholesale = toNum(this.value); });
+        rowEl.querySelector('.bc-s').addEventListener('input', function(){ regBatch.items[i].sale = toNum(this.value); });
+        rowEl.querySelector('.x').addEventListener('click', function(){
+          regBatch.items.splice(i, 1);
+          updateRegBar(); renderRegModal();
         });
       });
     }
 
     var qtyEl = $('#bcRegQty');
-    if(document.activeElement !== qtyEl) qtyEl.value = allBatchCodes().length;
+    if(document.activeElement !== qtyEl) qtyEl.value = regBatch.items.length;
 
-    $('#bcRegSaveBtn').disabled = regBatch.codes.length > 0 || regBatch.groups.length === 0;
+    $('#bcRegSaveBtn').disabled = regBatch.items.length === 0;
   }
 
-  $('#bcGroupSaveBtn').addEventListener('click', function(){
-    if(!bcSelectedUngrouped.size){ showToast('اختر باركودًا واحدًا على الأقل من القائمة أعلاه', 'danger'); return; }
-    var wholesale = toNum($('#bcGroupWholesale').value);
-    var sale = toNum($('#bcGroupSale').value);
-    var codes = regBatch.codes.filter(function(c){ return bcSelectedUngrouped.has(c); });
-    regBatch.codes = regBatch.codes.filter(function(c){ return !bcSelectedUngrouped.has(c); });
-    regBatch.groups.push({ codes: codes, wholesalePrice: wholesale, salePrice: sale });
-    bcSelectedUngrouped.clear();
-    $('#bcGroupWholesale').value = ''; $('#bcGroupSale').value = '';
+  $('#bcBulkApplyBtn').addEventListener('click', function(){
+    if(!regBatch.items.length){ showToast('لا توجد باركودات بعد', 'danger'); return; }
+    var w = toNum($('#bcBulkWholesale').value);
+    var s = toNum($('#bcBulkSale').value);
+    regBatch.items.forEach(function(it){ it.wholesale = w; it.sale = s; });
     renderRegModal();
+    showToast('تم تطبيق السعر على كل الباركودات — يمكنك تعديل أي باركود منها فرديًا الآن', 'success');
   });
 
   function openRegModal(){
-    bcSelectedUngrouped.clear();
     $('#bcProdNames').innerHTML = App.state.products.filter(function(p){ return p.kind === 'accessory'; })
       .map(function(p){ return '<option value="' + esc(p.name) + '">'; }).join('');
     renderRegModal();
@@ -7702,8 +7679,7 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
 
   $('#bcRegClearBtn').addEventListener('click', function(){
     askConfirm('إلغاء الدفعة بالكامل؟', 'سيتم فقدان كل الباركودات الممسوحة وغير المحفوظة في هذه الدفعة الحالية.', function(){
-      regBatch = { codes: [], groups: [] };
-      bcSelectedUngrouped.clear();
+      regBatch = { items: [] };
       updateRegBar(); renderRegModal();
       showToast('تم إلغاء الدفعة', 'info');
     });
@@ -7712,26 +7688,34 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
   $('#bcRegSaveBtn').addEventListener('click', async function(){
     var name = $('#bcRegProductName').value.trim();
     if(!name){ showToast('اكتب اسم المنتج أولًا', 'danger'); return; }
-    if(!regBatch.groups.length){ showToast('احفظ مجموعة سعر واحدة على الأقل قبل الحفظ', 'danger'); return; }
-    var qty = Math.max(0, parseInt($('#bcRegQty').value, 10) || 0);
-    var totalCodes = allBatchCodes().length;
-    var btn = this; btn.disabled = true;
-    try{
-      var body = {
-        productName: name, qty: qty,
-        groups: regBatch.groups.map(function(g){
-          return { barcodes: g.codes, wholesalePrice: g.wholesalePrice, salePrice: g.salePrice };
-        })
-      };
-      await apiPost('/inventory/barcode-batches', body);
-      showToast('تم حفظ المنتج "' + name + '" بعدد ' + totalCodes + ' باركود', 'success');
-      regBatch = { codes: [], groups: [] };
-      bcSelectedUngrouped.clear();
-      bcRegModal.classList.remove('show');
-      updateRegBar();
-      await reload(); renderAll();
-    }catch(err){ apiFail(err); }
-    finally{ btn.disabled = false; }
+    if(!regBatch.items.length){ showToast('لا توجد باركودات في هذه الدفعة', 'danger'); return; }
+    var missing = regBatch.items.some(function(it){ return !it.sale; });
+    if(missing){
+      askConfirm('بعض الباركودات بسعر بيع صفر', 'هل تريد المتابعة رغم ذلك؟', function(){ doSaveBatch(); });
+      return;
+    }
+    doSaveBatch();
+
+    async function doSaveBatch(){
+      var qty = Math.max(0, parseInt($('#bcRegQty').value, 10) || 0);
+      var totalCodes = regBatch.items.length;
+      var btn = $('#bcRegSaveBtn'); btn.disabled = true;
+      try{
+        var body = {
+          productName: name, qty: qty,
+          groups: regBatch.items.map(function(it){
+            return { barcodes: [it.code], wholesalePrice: it.wholesale, salePrice: it.sale };
+          })
+        };
+        await apiPost('/inventory/barcode-batches', body);
+        showToast('تم حفظ المنتج "' + name + '" بعدد ' + totalCodes + ' باركود', 'success');
+        regBatch = { items: [] };
+        bcRegModal.classList.remove('show');
+        updateRegBar();
+        await reload(); renderAll();
+      }catch(err){ apiFail(err); }
+      finally{ btn.disabled = false; }
+    }
   });
 
   $('#bcRegStopBtn').addEventListener('click', function(){
