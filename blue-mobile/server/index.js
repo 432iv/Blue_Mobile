@@ -5,6 +5,8 @@
    Frontend  ->  Express API  ->  PostgreSQL
    =================================================================== */
 const path = require("path");
+const fs = require("fs");
+const zlib = require("zlib");
 const express = require("express");
 const cookieParser = require("cookie-parser");
 
@@ -19,6 +21,30 @@ app.disable("x-powered-by");
 
 app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
+
+/* ───────── gzip للردود الكبيرة (بلا أي حزم إضافية) ─────────
+   bootstrap يعيد مئات الكيلوبايتات JSON؛ الضغط يقلّل زمن النقل
+   بشكل كبير على الشبكات البطيئة. الردود الصغيرة تمرّ كما هي. */
+const wantsGzip = req => /\bgzip\b/.test(String(req.headers["accept-encoding"] || ""));
+app.use((req, res, next) => {
+  if (!wantsGzip(req)) return next();
+  const origJson = res.json.bind(res);
+  res.json = function (obj) {
+    let payload;
+    try { payload = JSON.stringify(obj); } catch (e) { return origJson(obj); }
+    if (Buffer.byteLength(payload, "utf8") < 1024) return origJson(obj);
+    zlib.gzip(payload, (err, buf) => {
+      if (err || res.headersSent) { if (!res.headersSent) origJson(obj); return; }
+      res.setHeader("Vary", "Accept-Encoding");
+      res.setHeader("Content-Encoding", "gzip");
+      if (!res.getHeader("Content-Type")) res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Length", buf.length);
+      res.end(buf);
+    });
+    return res;
+  };
+  next();
+});
 
 /* ---- baseline security headers (no external CDN except Google Fonts) ---- */
 app.use((req, res, next) => {
@@ -70,12 +96,35 @@ app.use("/api", api);
 /* ---------------- frontend ---------------- */
 const ROOT = path.join(__dirname, "..");
 const INDEX = path.join(ROOT, "Blue-Mobile.html");
-app.get("/", (_req, res) => res.sendFile(INDEX));
+
+/* الصفحة (~745KB) تُضغط gzip مرة واحدة وتبقى في الذاكرة؛
+   Cache-Control: no-cache يطلب إعادة تحقق خفيفة (304)
+   بدل إعادة تنزيل الملف كاملًا في كل زيارة. */
+let indexGz = null, indexMtime = "";
+function sendIndex(req, res) {
+  try {
+    const st = fs.statSync(INDEX);
+    if (!indexGz || indexMtime !== String(st.mtimeMs)) {
+      indexMtime = String(st.mtimeMs);
+      indexGz = zlib.gzipSync(fs.readFileSync(INDEX), { level: 9 });
+    }
+  } catch (e) { indexGz = null; }
+  res.setHeader("Cache-Control", "no-cache");
+  if (indexGz && wantsGzip(req)) {
+    res.setHeader("Vary", "Accept-Encoding");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Content-Encoding", "gzip");
+    res.setHeader("Content-Length", indexGz.length);
+    return res.end(indexGz);
+  }
+  return res.sendFile(INDEX);
+}
+app.get("/", (_req, res) => sendIndex(_req, res));
 app.get("/index.html", (_req, res) => res.redirect("/"));
 /* التطبيق فقط هو العام — كود الخادم وملف البيانات وغيرها لا تُقدَّم إطلاقاً */
 app.use((req, res, next) => {
   if (req.method === "GET" && !req.path.startsWith("/api")) {
-    return res.sendFile(INDEX);
+    return sendIndex(req, res);
   }
   next();
 });
