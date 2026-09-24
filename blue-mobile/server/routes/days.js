@@ -27,16 +27,18 @@ router.get("/", wrap(async (req, res) => {
   const { rows } = await db.query(
     `SELECT * FROM days d ${where} ORDER BY d.day_date DESC`, params);
 
-  const days = [];
-  for (const r of rows) {
-    const { totals, cashBalanceAtClose, frozen } = await ledger.daySummaryForApi(r.id);
-    days.push(Object.assign(mapDay(r), {
+  /* إجماليات كل الأيام دفعة واحدة (بدل استعلام لكل يوم) */
+  const summaries = await ledger.daySummariesForApi(rows.map(r => r.id));
+  const days = rows.map(r => {
+    const sum = summaries.get(String(r.id));
+    const totals = sum ? sum.totals : ledger.zeroTotals();
+    return Object.assign(mapDay(r), {
       totals,
-      cashBalanceAtClose,
-      frozen,
+      cashBalanceAtClose: sum ? sum.cashBalanceAtClose : null,
+      frozen: sum ? sum.frozen : false,
       netProfit: totals.netProfit
-    }));
-  }
+    });
+  });
   res.json({
     days,
     sessions: days,                     /* توافق مع الواجهة السابقة */

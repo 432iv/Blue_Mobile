@@ -107,12 +107,13 @@ router.get("/bootstrap", wrap(async (req, res) => {
     byInv.get(String(it.invoice_id)).push(it);
   }
 
-  /* إجماليات كل يوم (لقطة ثابتة للمغلقة) */
-  const daysOut = [];
-  for (const r of days.rows) {
-    const { totals } = await ledger.daySummaryForApi(r.id);
-    daysOut.push(Object.assign(mapDay(r), { totals, netProfit: totals.netProfit }));
-  }
+  /* إجماليات كل يوم في استعلام واحد — كان استعلامًا لكل يوم وهذا كان يبطئ bootstrap */
+  const daySummaries = await ledger.daySummariesForApi(days.rows.map(r => r.id));
+  const daysOut = days.rows.map(r => {
+    const sum = daySummaries.get(String(r.id));
+    const totals = sum ? sum.totals : ledger.zeroTotals();
+    return Object.assign(mapDay(r), { totals, netProfit: totals.netProfit });
+  });
 
   const g = dashboard.rows[0];
   res.json({
