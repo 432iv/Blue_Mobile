@@ -182,8 +182,143 @@ async function daySummaryForApi(dayId, client) {
   return { totals, cashBalanceAtClose: null, frozen: false };
 }
 
+/* إجماليات يوم بلا أي عمليات — مطابقة لصفر dayTotals */
+function zeroTotals() {
+  return {
+    total: 0, cost: 0, profit: 0, count: 0, cash: 0, card: 0, unpaid: 0, byMethod: {},
+    purchases: { total: 0, paid: 0, count: 0 },
+    expenses: { total: 0, count: 0, byCategory: {} },
+    cashFlow: { in: 0, out: 0, net: 0, salesCash: 0, salesCard: 0, refunds: 0,
+                expenses: 0, purchases: 0, deposits: 0, withdrawals: 0 },
+    netProfit: 0, noteCount: 0, returnCount: 0
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   إجماليات عدة أيام في استعلام واحد — بديل N+1.
+   كان كل طلب bootstrap ينفّذ استعلامًا لكل يوم (400 يوم ≈ 400+ استعلام
+   متتالي) وهو السبب الرئيسي في بطء النظام. الآن: لقطات جاهزة في
+   استعلام واحد + حساب الأيام المفتوحة في 8 استعلامات متوازية.
+   ───────────────────────────────────────────────────────────────────── */
+async function daySummariesForApi(dayIds, client) {
+  const q = client || db;
+  const ids = (dayIds || []).map(String);
+  const out = new Map();
+  if (!ids.length) return out;
+
+  /* 1) أيام مغلقة: اللقطة المخزنة تكفي (بدون أي حساب) */
+  const snaps = await q.query(
+    `SELECT ds.day_id, ds.snapshot, ds.cash_balance
+       FROM day_summaries ds
+      WHERE ds.day_id = ANY($1::bigint[])`, [ids]);
+  for (const row of snaps.rows) {
+    const snap = row.snapshot || {};
+    out.set(String(row.day_id), {
+      totals: snap.totals || zeroTotals(),
+      cashBalanceAtClose: Number(row.cash_balance),
+      frozen: true
+    });
+  }
+
+  /* 2) باقي الأيام (مفتوحة/بدون لقطة): تُحسب كلها دفعة واحدة */
+  const missing = ids.filter(id => !out.has(id));
+  if (!missing.length) return out;
+
+  const [salesR, byMethodR, purchasesR, expensesR, expByCatR, cashR, notesR, returnsR] = await Promise.all([
+    q.query(`SELECT i.day_id,
+                    COALESCE(SUM(i.total - i.refunded), 0)                                AS total,
+                    COALESCE(SUM(i.cost_total - (i.refunded - i.refunded_profit)), 0)     AS cost,
+                    COALESCE(SUM(i.profit - i.refunded_profit), 0)                        AS profit,
+                    COUNT(i.id)                                                           AS count,
+                    COALESCE(SUM(i.total - i.refunded) FILTER (WHERE i.payment_method = 'cash'), 0)  AS cash,
+                    COALESCE(SUM(i.total - i.refunded) FILTER (WHERE i.payment_method = 'card'), 0)  AS card,
+                    COALESCE(SUM(i.total - i.refunded) FILTER (WHERE i.payment_method = 'unpaid'), 0) AS unpaid
+               FROM invoices i
+              WHERE i.day_id = ANY($1::bigint[]) AND i.status <> 'cancelled'
+              GROUP BY i.day_id`, [missing]),
+    q.query(`SELECT day_id, payment_method AS pm, SUM(total - refunded) AS amt
+               FROM invoices
+              WHERE day_id = ANY($1::bigint[]) AND status <> 'cancelled'
+              GROUP BY 1, 2`, [missing]),
+    q.query(`SELECT day_id, COALESCE(SUM(total), 0) AS total,
+                    COALESCE(SUM(total) FILTER (WHERE paid), 0) AS paid_total, count(*) AS count
+               FROM purchases
+              WHERE day_id = ANY($1::bigint[]) AND status = 'completed'
+              GROUP BY day_id`, [missing]),
+    q.query(`SELECT day_id, COALESCE(SUM(amount), 0) AS total, count(*) AS count
+               FROM expenses WHERE day_id = ANY($1::bigint[]) GROUP BY day_id`, [missing]),
+    q.query(`SELECT day_id, category, SUM(amount) AS total
+               FROM expenses WHERE day_id = ANY($1::bigint[]) GROUP BY 1, 2`, [missing]),
+    q.query(`SELECT day_id,
+                    COALESCE(SUM(amount) FILTER (WHERE direction = 'in'  AND (method IS NULL OR method = 'cash')), 0) AS cash_in,
+                    COALESCE(SUM(amount) FILTER (WHERE direction = 'out' AND (method IS NULL OR method = 'cash')), 0) AS cash_out,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'sale'    AND direction = 'in'), 0)  AS sales_cash_in,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'sale'    AND method = 'card'), 0)   AS sales_card,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'refund'), 0)                        AS refunds,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'expense'  AND direction = 'out'), 0) AS expenses,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'purchase' AND direction = 'out'), 0) AS purchases_paid,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'deposit'), 0)                       AS deposits,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'withdrawal'), 0)                    AS withdrawals
+               FROM cash_movements WHERE day_id = ANY($1::bigint[]) GROUP BY day_id`, [missing]),
+    q.query("SELECT day_id, count(*)::int AS n FROM notes WHERE day_id = ANY($1::bigint[]) GROUP BY day_id", [missing]),
+    q.query("SELECT day_id, count(*)::int AS n FROM sale_returns WHERE day_id = ANY($1::bigint[]) GROUP BY day_id", [missing])
+  ]);
+
+  const byMethod = new Map();
+  for (const r of byMethodR.rows) {
+    const k = String(r.day_id);
+    if (!byMethod.has(k)) byMethod.set(k, {});
+    byMethod.get(k)[r.pm] = r2(r.amt);
+  }
+  const purchasesM = new Map(purchasesR.rows.map(r => [String(r.day_id), r]));
+  const expensesM  = new Map(expensesR.rows.map(r => [String(r.day_id), r]));
+  const cashM      = new Map(cashR.rows.map(r => [String(r.day_id), r]));
+  const notesM     = new Map(notesR.rows.map(r => [String(r.day_id), r.n]));
+  const returnsM   = new Map(returnsR.rows.map(r => [String(r.day_id), r.n]));
+  const salesM     = new Map(salesR.rows.map(r => [String(r.day_id), r]));
+  const expCat = new Map();
+  for (const r of expByCatR.rows) {
+    const k = String(r.day_id);
+    if (!expCat.has(k)) expCat.set(k, {});
+    expCat.get(k)[r.category] = r2(r.total);
+  }
+
+  for (const id of missing) {
+    const s = salesM.get(id);
+    const p = purchasesM.get(id);
+    const e = expensesM.get(id);
+    const c = cashM.get(id);
+    const profit = r2(s ? s.profit : 0);
+    const expensesTotal = r2(e ? e.total : 0);
+    out.set(id, {
+      totals: {
+        total: r2(s ? s.total : 0), cost: r2(s ? s.cost : 0), profit,
+        count: s ? Number(s.count) : 0,
+        cash: r2(s ? s.cash : 0), card: r2(s ? s.card : 0), unpaid: r2(s ? s.unpaid : 0),
+        byMethod: byMethod.get(id) || {},
+        purchases: { total: r2(p ? p.total : 0), paid: r2(p ? p.paid_total : 0), count: p ? Number(p.count) : 0 },
+        expenses: { total: expensesTotal, count: e ? Number(e.count) : 0, byCategory: expCat.get(id) || {} },
+        cashFlow: {
+          in: r2(c ? c.cash_in : 0), out: r2(c ? c.cash_out : 0),
+          net: r2((c ? c.cash_in : 0) - (c ? c.cash_out : 0)),
+          salesCash: r2(c ? c.sales_cash_in : 0), salesCard: r2(c ? c.sales_card : 0),
+          refunds: r2(c ? c.refunds : 0), expenses: r2(c ? c.expenses : 0),
+          purchases: r2(c ? c.purchases_paid : 0),
+          deposits: r2(c ? c.deposits : 0), withdrawals: r2(c ? c.withdrawals : 0)
+        },
+        netProfit: r2(profit - expensesTotal),
+        noteCount: Number(notesM.get(id) || 0),
+        returnCount: Number(returnsM.get(id) || 0)
+      },
+      cashBalanceAtClose: null,
+      frozen: false
+    });
+  }
+  return out;
+}
+
 module.exports = {
   r2, invoiceEffective, getOpenDay, requireOpenDay, dayById, assertDayOpen,
   recordCashMove, reverseCashMove, cashBalance, recordStockMove,
-  dayTotals, buildDaySnapshot, daySummaryForApi, DAY_SALES_TOTALS
+  dayTotals, buildDaySnapshot, daySummaryForApi, daySummariesForApi, zeroTotals, DAY_SALES_TOTALS
 };
