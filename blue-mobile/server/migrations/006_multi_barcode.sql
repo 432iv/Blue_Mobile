@@ -23,4 +23,3 @@ ON CONFLICT (barcode) DO NOTHING;
 ALTER TABLE settings
   ADD COLUMN IF NOT EXISTS barcode_register_mode BOOLEAN NOT NULL DEFAULT FALSE;
 
-INSERT INTO schema_migrations (filename) VALUES ('006_multi_barcode.sql') ON CONFLICT DO NOTHING;

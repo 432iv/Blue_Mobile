@@ -122,7 +122,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await page.click("#rowsWrap .q-inc");
   check("الكمية 2", (await page.textContent("#rowsWrap .q")).trim() === "2");
   await page.click("#recordBtn");
-  await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"), null, { timeout: 8000 });
+  await page.waitForFunction(() => {
+    const t = document.querySelector("#toast");
+    return t.classList.contains("show") && document.querySelector("#toastMsg").textContent.includes("INV");
+  }, null, { timeout: 8000 });
   check("تسجيل بيع نقدي + إشعار", (await page.textContent("#toastMsg")).includes("INV"));
   /* الفاتورة تُعرض تلقائيًا بعد التسجيل — أغلقها */
   await page.waitForSelector("#detailModal.show", { timeout: 6000 });
@@ -151,7 +154,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await page.click('#payCards .pay-opt[data-pay="بطاقة"]');
   await page.fill("#discInput", "50");
   await page.click("#recordBtn");
-  await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"), null, { timeout: 8000 });
+  await page.waitForFunction(() => {
+    const t = document.querySelector("#toast");
+    return t.classList.contains("show") && document.querySelector("#toastMsg").textContent.includes("INV");
+  }, null, { timeout: 8000 });
   check("بيع الهاتفين بالبطاقة مع خصم 50", (await page.textContent("#toastMsg")).includes("INV"));
   await page.click('#detailModal [data-close]').catch(() => {});
   await page.waitForFunction(() => !document.querySelector("#detailModal").classList.contains("show"), null, { timeout: 6000 });
@@ -177,7 +183,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await page.fill("#purRowsWrap .c-input", "22");
   await page.click("#purRowsWrap .q-inc");
   await page.click("#purRecordBtn");
-  await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"), null, { timeout: 8000 });
+  await page.waitForFunction(() => {
+    const t = document.querySelector("#toast");
+    return t.classList.contains("show") && document.querySelector("#toastMsg").textContent.includes("PUR");
+  }, null, { timeout: 8000 });
   check("تسجيل فاتورة شراء مدفوعة", (await page.textContent("#toastMsg")).includes("PUR"));
   /* تفاصيل فاتورة الشراء تُفتح تلقائيًا — أغلقها */
   await page.waitForSelector("#purchaseModal.show", { timeout: 6000 });
@@ -370,7 +379,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await page.waitForSelector("#view-settings.active");
   await page.fill("#shopNameInput", "بلو موبايل — طرابلس");
   await page.click("#shopSaveBtn");
-  await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"), null, { timeout: 8000 });
+  await page.waitForFunction(() => {
+    const t = document.querySelector("#toast");
+    return t.classList.contains("show") && document.querySelector("#toastMsg").textContent.includes("المحل");
+  }, null, { timeout: 8000 });
   check("حفظ بيانات المحل", (await page.textContent("#toastMsg")).includes("المحل"));
 
   /* التبديل للفاتح ثم رجوع */
