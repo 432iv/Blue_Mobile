@@ -1599,6 +1599,15 @@ html[data-theme="light"] .gate{background:radial-gradient(1100px 500px at 50% -1
         تسجيل الدخول
       </button>
       <p class="gate-alt">لا تملك حسابًا بعد؟ <button type="button" class="gate-switch" data-mode="setup">إنشاء الحساب</button></p>
+      <div style="display:flex; align-items:center; gap:10px; margin:14px 0;">
+        <div style="flex:1; height:1px; background:var(--card-brd);"></div>
+        <span style="font-size:.78rem; opacity:.6;">أو</span>
+        <div style="flex:1; height:1px; background:var(--card-brd);"></div>
+      </div>
+      <a href="/api/auth/google" class="btn btn-ghost gate-submit" style="text-decoration:none; display:flex; align-items:center; justify-content:center; gap:8px;">
+        <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.9 32.6 29.4 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.5 6.1 29.5 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.2-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 16 19 13 24 13c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.5 6.1 29.5 4 24 4 16.1 4 9.2 8.4 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.3 0 10.1-2 13.7-5.4l-6.3-5.3C29.4 35.1 26.8 36 24 36c-5.4 0-9.9-3.4-11.5-8.2l-6.5 5C9.1 39.6 16 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1.1 3.2-3.3 5.7-6.1 7.3l6.3 5.3C39.9 37.3 44 31.4 44 24c0-1.2-.1-2.4-.4-3.5z"/></svg>
+        <span>الدخول عبر جوجل</span>
+      </a>
     </form>
 
     <form id="gateSetup" class="gate-form" hidden novalidate>
